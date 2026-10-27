@@ -70,6 +70,15 @@ class LiveResultTests(unittest.TestCase):
         payload['upsellBoundAvailList'][0]['availFlightList'][0]['commercialFareFamilyList'][0]['soldout'] = True
         self.assertEqual(self.check(payload)[0], '예매 검색에서 선택 불가')
 
+    def test_production_soldout_shape_with_empty_booking_class(self):
+        payload = live_fixture('0')
+        segment = payload['upsellBoundAvailList'][0]['availFlightList'][0]
+        segment['flightInfoList'][0]['departureDateTime'] = '20271022100000'
+        fare = segment['commercialFareFamilyList'][0]
+        fare['bookingClass'] = ''
+        fare['soldout'] = True
+        self.assertEqual(self.check(payload), ('예매 검색에서 선택 불가', None))
+
     def test_unknown_seat_count_is_not_confirmation(self):
         for count in (None, True, 'unknown', '9+', -1):
             with self.subTest(count=count), self.assertRaises(ValueError):
@@ -126,6 +135,13 @@ class HTTPTests(unittest.TestCase):
                 if self.path == LOGIN_PATH:
                     self.server.login_calls += 1
                     self.server.login_body = deepcopy(body)
+                    self.server.login_session_id = self.headers.get('ksessionId')
+                    self.server.login_timestamp = self.headers.get('timestamp')
+                    if self.server.mode == 'login-http403':
+                        self.send_response(403)
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'message': body['password']}).encode())
+                        return
                     self.send_response(200)
                     if self.server.mode != 'login-fail':
                         self.send_header('Set-Cookie', 'auth-test=1; Path=/; HttpOnly')
@@ -143,6 +159,7 @@ class HTTPTests(unittest.TestCase):
                         self.end_headers()
                         return
                     self.server.live_calls += 1
+                    self.server.live_session_id = self.headers.get('ksessionId')
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(json.dumps(live_fixture()).encode())
@@ -214,6 +231,9 @@ class HTTPTests(unittest.TestCase):
         result = self.client.fetch_live('ICN', 'JFK', date(2027, 10, 22))
         self.assertEqual(live_result(result, 'ICN', 'JFK', LIVE_ROW)[0], '예매 검색에서 선택 가능')
         self.assertEqual(self.server.live_calls, 1)
+        self.assertRegex(self.server.login_session_id, r'^[a-f0-9]{32}\d{8}W$')
+        self.assertEqual(self.server.live_session_id, self.server.login_session_id)
+        self.assertRegex(self.server.login_timestamp, r'^\d{13}$')
         self.assertEqual(self.server.last_body['segmentList'][0]['departureDate'], '20271022')
         self.assertEqual(self.server.last_body['commercialFareFamilies'], ['KEBONUSNEW'])
         self.assertEqual(len(self.server.last_body['travelers']), 1)
@@ -240,6 +260,15 @@ class HTTPTests(unittest.TestCase):
         self.assertNotIn('private-id', str(caught.exception))
         self.assertEqual(self.server.login_calls, 1)
         self.assertIsNone(self.client.traveler)
+
+    def test_login_http_status_retained_without_secret_response(self):
+        self.client.initialize()
+        self.server.mode = 'login-http403'
+        with self.assertRaisesRegex(RuntimeError, 'HTTP 403') as caught:
+            self.client.login_from_env({'KOREANAIR_USERNAME': 'private-id', 'KOREANAIR_PASSWORD': 'private-password'})
+        self.assertNotIn('private-password', str(caught.exception))
+        self.assertNotIn('private-id', str(caught.exception))
+        self.assertEqual(self.server.login_calls, 1)
 
     def test_live_search_requires_login(self):
         with self.assertRaisesRegex(RuntimeError, '로그인'):

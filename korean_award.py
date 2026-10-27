@@ -9,6 +9,7 @@ import http.cookiejar
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 URL = 'https://www.koreanair.com/booking/book-and-manage/award-seat-availability'
 API_PATH = '/api/hmp/bonusSeatView/bonusSeatView'
@@ -192,10 +193,12 @@ class AwardClient:
             'Origin': self.base_url,
             'Referer': self.page_url,
             'channel': 'pc',
+            'ksessionId': uuid.uuid4().hex + datetime.now(KST).strftime('%Y%m%d') + 'W',
         }
 
     def _request(self, url, body=None):
         headers = dict(self.headers)
+        headers['timestamp'] = str(time.time_ns() // 1_000_000)
         if body is not None:
             for cookie in self.cookies:
                 if cookie.name == 'XSRF-TOKEN' and not cookie.is_expired():
@@ -208,8 +211,10 @@ class AwardClient:
             with self.opener.open(request, timeout=30) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
+            status = exc.code
+            exc.close()
             raise RuntimeError(
-                f'HTTP {exc.code}: 조회를 거부했거나 처리하지 못했습니다. '
+                f'HTTP {status}: 조회를 거부했거나 처리하지 못했습니다. '
                 '차단 또는 인증 요구를 확인하세요.') from None
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(f'네트워크 요청 실패 ({type(exc).__name__})') from None
@@ -245,9 +250,11 @@ class AwardClient:
         try:
             raw = self._request(self.base_url + LOGIN_PATH, body)
             payload = json.loads(raw)
-        except Exception:
-            # Login responses can echo private fields. Never propagate their text.
-            raise RuntimeError('로그인 실패: 계정 정보, 추가 인증 또는 접근 제한을 확인하세요. 자동 재시도하지 않습니다.') from None
+        except Exception as exc:
+            # Preserve only our HTTP status, never a response body or private fields.
+            status = re.match(r'^HTTP (\d{3}):', str(exc))
+            reason = f' (HTTP {status[1]})' if status else ''
+            raise RuntimeError(f'로그인 실패{reason}: 계정 정보, 추가 인증 또는 접근 제한을 확인하세요. 자동 재시도하지 않습니다.') from None
         finally:
             body.clear()
             del password, username
@@ -363,7 +370,7 @@ def main():
         stamp = datetime.now(KST).isoformat(timespec='seconds')
         count = f' / 응답 좌석 수 {seats}' if seats is not None else ''
         print('\t'.join(row) + f'\t{status}{count} / 확인 {stamp}', flush=True)
-    print('예매 검색에서 선택 가능한 상태를 확인한 것이며, 좌석 확보·예약 생성·결제는 하지 않습니다.')
+    print('결과는 예매 검색 시점의 상태입니다. 좌석 확보·예약 생성·결제는 하지 않습니다.')
     if incomplete:
         raise RuntimeError('일부 후보의 실시간 상태를 확인하지 못했습니다. 미확인을 좌석 없음으로 판단하지 마세요.')
 

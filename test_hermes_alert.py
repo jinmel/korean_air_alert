@@ -45,6 +45,21 @@ class FakeClient:
             raise self.login_error
 
 
+class SessionClient(FakeClient):
+    """Accepts only the given tokens, mapping each to its rotated value."""
+
+    def __init__(self, valid, leak=False):
+        super().__init__()
+        self.valid = valid
+        self.leak = leak
+
+    def login_from_session(self, token):
+        self.session_calls.append(token)
+        if token not in self.valid:
+            raise RuntimeError(f'세션 만료 {token}' if self.leak else '세션 만료')
+        return self.valid[token]
+
+
 class HermesAlertTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -228,6 +243,116 @@ class HermesAlertTests(unittest.TestCase):
         self.assertIn('대한항공 보너스 알림 실패:', output.getvalue())
         self.assertNotIn('one-time-private-token', output.getvalue())
         self.assertFalse(failed_file.exists())
+
+    def run_with_chrome(self, client, session_token=None, grabbed='chrome-session-token',
+                        grab_error=None, push_error=None, extra_args=('--cdp', 'http://cdp')):
+        session_file = Path(self.directory.name) / 'session.json'
+        if session_token:
+            session_file.write_text(json.dumps({'T': session_token}))
+        grab_calls, push_calls = [], []
+
+        def grab(url):
+            grab_calls.append(url)
+            if grab_error:
+                raise grab_error
+            return grabbed
+
+        def push(token, url):
+            push_calls.append((token, url))
+            if push_error:
+                raise push_error
+
+        with (patch('hermes_alert.grab_session_token', side_effect=grab),
+              patch('hermes_alert.push_session_token', side_effect=push)):
+            result, output, client = self.run_alert(
+                client=client, environ={}, session_file=session_file,
+                extra_args=extra_args)
+        return result, output, session_file, grab_calls, push_calls
+
+    def test_expired_session_is_replaced_from_chrome(self):
+        client = SessionClient({'chrome-session-token': 'rotated-from-chrome'})
+        result, output, session_file, grabs, pushes = self.run_with_chrome(
+            client, session_token='expired-private-token')
+        self.assertEqual((result, output), (0, ''))
+        self.assertEqual(client.session_calls, ['expired-private-token', 'chrome-session-token'])
+        self.assertEqual(grabs, ['http://cdp'])
+        self.assertEqual(json.loads(session_file.read_text())['T'], 'rotated-from-chrome')
+        self.assertEqual(pushes, [('rotated-from-chrome', 'http://cdp')])
+
+    def test_missing_session_is_grabbed_from_chrome(self):
+        client = SessionClient({'chrome-session-token': 'rotated-from-chrome'})
+        result, _, session_file, grabs, _ = self.run_with_chrome(client)
+        self.assertEqual(result, 0)
+        self.assertEqual(client.session_calls, ['chrome-session-token'])
+        self.assertEqual(grabs, ['http://cdp'])
+        self.assertEqual(json.loads(session_file.read_text())['T'], 'rotated-from-chrome')
+
+    def test_valid_session_does_not_grab_but_syncs_chrome(self):
+        client = SessionClient({'stored-token': 'rotated-stored'})
+        result, _, _, grabs, pushes = self.run_with_chrome(client, session_token='stored-token')
+        self.assertEqual(result, 0)
+        self.assertEqual(grabs, [])
+        self.assertEqual(pushes, [('rotated-stored', 'http://cdp')])
+
+    def test_same_expired_token_in_chrome_is_not_retried(self):
+        client = SessionClient({})
+        result, output, _, _, pushes = self.run_with_chrome(
+            client, session_token='expired-private-token', grabbed='expired-private-token')
+        self.assertEqual(result, 1)
+        self.assertEqual(client.session_calls, ['expired-private-token'])
+        self.assertIn('다시 로그인', output)
+        self.assertNotIn('expired-private-token', output)
+        self.assertEqual(pushes, [])
+
+    def test_chrome_grab_failure_combines_errors(self):
+        client = SessionClient({})
+        result, output, _, _, _ = self.run_with_chrome(
+            client, session_token='expired-private-token',
+            grab_error=RuntimeError('Chrome 원격 디버깅(http://cdp)에 연결할 수 없습니다.'))
+        self.assertEqual(result, 1)
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn('세션 만료', output)
+        self.assertIn('Chrome 세션 가져오기 실패', output)
+        self.assertNotIn('expired-private-token', output)
+
+    def test_grabbed_token_failure_is_redacted(self):
+        client = SessionClient({}, leak=True)
+        result, output, _, _, _ = self.run_with_chrome(client, grabbed='grabbed-private-token')
+        self.assertEqual(result, 1)
+        self.assertNotIn('grabbed-private-token', output)
+
+    def test_push_failure_does_not_change_result(self):
+        client = SessionClient({'stored-token': 'rotated-stored'})
+        result, output, _, _, _ = self.run_with_chrome(
+            client, session_token='stored-token', push_error=RuntimeError('boom'))
+        self.assertEqual((result, output), (0, ''))
+
+    def test_without_cdp_chrome_is_never_used(self):
+        client = SessionClient({})
+        result, _, _, grabs, pushes = self.run_with_chrome(
+            client, session_token='expired-private-token', extra_args=())
+        self.assertEqual(result, 1)
+        self.assertEqual((grabs, pushes), ([], []))
+
+    def test_grab_session_success_and_failure(self):
+        for grabbed, expected in (('chrome-session-token', 0), ('bad-private-token', 1)):
+            session_file = Path(self.directory.name) / f'{grabbed}.json'
+            client = SessionClient({'chrome-session-token': 'rotated-from-chrome'})
+            output = io.StringIO()
+            with (patch('hermes_alert.grab_session_token', return_value=grabbed) as grab,
+                  redirect_stdout(output)):
+                result = hermes_alert.run(
+                    ['--grab-session', '--session', str(session_file)],
+                    environ={}, client_factory=lambda: client,
+                    now=datetime(2027, 10, 22, 9, 0, tzinfo=KST))
+            grab.assert_called_once_with('http://127.0.0.1:9222')
+            self.assertEqual(result, expected)
+            self.assertNotIn(grabbed, output.getvalue())
+            if expected == 0:
+                self.assertIn('세션 저장 완료 (Chrome에서 가져옴, 확인', output.getvalue())
+                self.assertEqual(json.loads(session_file.read_text())['T'], 'rotated-from-chrome')
+            else:
+                self.assertFalse(session_file.exists())
 
     def test_public_cache_skips_scan_until_expired_or_disabled(self):
         calls = []

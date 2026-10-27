@@ -9,6 +9,7 @@ import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from chrome_session import DEFAULT_CDP_URL, grab_session_token, push_session_token
 from korean_award import (
     AwardClient, KST, find_candidates, login_settings, query_window,
     verify_candidates,
@@ -106,11 +107,11 @@ def _cache_is_fresh(entry, checked_at, start, hours):
     return timedelta(0) <= age < timedelta(hours=hours)
 
 
-def _failure_message(exc, environ, session_token=None):
+def _failure_message(exc, environ, session_tokens=()):
     message = str(exc).splitlines()[0].strip() if str(exc).splitlines() else ''
     secrets = [environ.get(name) for name in (
         'KOREANAIR_USERNAME', 'KOREANAIR_PASSWORD', 'KOREANAIR_SESSION_T')]
-    secrets.append(session_token)
+    secrets.extend(session_tokens)
     for secret in secrets:
         if secret:
             message = message.replace(secret, '[숨김]')
@@ -127,6 +128,35 @@ def _current_time(now):
     raise TypeError('현재 시각 형식이 올바르지 않습니다.')
 
 
+def _login_with_session(client, token, cdp_url, seen_tokens):
+    """Return the rotated session token, or '' when no session is configured."""
+    failure = None
+    if token:
+        try:
+            rotated = client.login_from_session(token)
+            seen_tokens.append(rotated)
+            return rotated
+        except RuntimeError as exc:
+            failure = exc
+    if not cdp_url:
+        if failure:
+            raise failure
+        return ''
+    try:
+        grabbed = grab_session_token(cdp_url)
+    except RuntimeError as exc:
+        if failure:
+            raise RuntimeError(f'{failure}; Chrome 세션 가져오기 실패: {exc}') from None
+        raise
+    seen_tokens.append(grabbed)
+    if grabbed == token:
+        raise RuntimeError(f'{failure}; Chrome 세션도 같은 만료된 T입니다: '
+                           '그 Chrome에서 koreanair.com에 다시 로그인하세요.')
+    rotated = client.login_from_session(grabbed)
+    seen_tokens.append(rotated)
+    return rotated
+
+
 def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, now=None):
     parser = argparse.ArgumentParser(description='대한항공 보너스 좌석 cron 알림')
     parser.add_argument('--route', action='append',
@@ -134,8 +164,13 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
     parser.add_argument('--days', type=int, default=360, help='조회 일수 (기본: 360)')
     parser.add_argument('--state', help='알림 상태 파일 경로')
     parser.add_argument('--session', help='브라우저 세션 쿠키 파일 경로')
-    parser.add_argument('--save-session', action='store_true',
-                        help='브라우저 세션 쿠키를 확인하고 저장합니다.')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--save-session', action='store_true',
+                      help='브라우저 세션 쿠키를 확인하고 저장합니다.')
+    mode.add_argument('--grab-session', action='store_true',
+                      help='Chrome 원격 디버깅에서 세션 쿠키를 가져와 저장합니다.')
+    parser.add_argument('--cdp', help='세션 만료 시 T를 가져올 Chrome 원격 디버깅 주소, '
+                        f'예: {DEFAULT_CDP_URL}')
     parser.add_argument('--public-cache-hours', type=float, default=3,
                         help='공개 현황 캐시 시간 (기본: 3, 0은 비활성화)')
     args = parser.parse_args(argv)
@@ -146,7 +181,7 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
         origin, destination = route.split('-')
         if origin == destination:
             parser.error('--route의 출발 공항과 도착 공항은 달라야 합니다.')
-    if not args.save_session and not routes:
+    if not args.save_session and not args.grab_session and not routes:
         parser.error('--route를 하나 이상 지정해야 합니다.')
     if args.days < 1:
         parser.error('--days는 1 이상이어야 합니다.')
@@ -160,26 +195,39 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
     selected_session = (
         args.session or environ.get('KOREANAIR_SESSION_FILE') or DEFAULT_SESSION)
     session_path = Path(selected_session).expanduser()
-    session_token = ''
+    cdp_url = args.cdp or environ.get('KOREANAIR_CDP_URL') or ''
+    session_tokens = []
     try:
         checked_at = _current_time(now)
         stamp = checked_at.isoformat(timespec='seconds')
-        if args.save_session:
-            session_token = getpass.getpass('세션 쿠키 T (입력 숨김): ').strip()
+        if args.save_session or args.grab_session:
+            if args.save_session:
+                token = getpass.getpass('세션 쿠키 T (입력 숨김): ').strip()
+            else:
+                token = grab_session_token(cdp_url or DEFAULT_CDP_URL)
+            session_tokens.append(token)
             client = client_factory()
             client.initialize()
-            rotated = client.login_from_session(session_token)
+            rotated = client.login_from_session(token)
+            session_tokens.append(rotated)
             _write_json_atomic(session_path, {'T': rotated, 'updated': stamp})
-            print(f'세션 저장 완료 (확인 {stamp})')
+            source = 'Chrome에서 가져옴, ' if args.grab_session else ''
+            print(f'세션 저장 완료 ({source}확인 {stamp})')
             return 0
 
         today = checked_at.date()
         client = client_factory()
         client.initialize()
         session_token = _read_session(session_path, environ)
+        session_tokens.append(session_token)
+        session_token = _login_with_session(client, session_token, cdp_url, session_tokens)
         if session_token:
-            session_token = client.login_from_session(session_token)
             _write_json_atomic(session_path, {'T': session_token, 'updated': stamp})
+            if cdp_url:
+                try:
+                    push_session_token(session_token, cdp_url)
+                except Exception:
+                    pass
 
         state = _read_state(path)
         public = dict(state['public'])
@@ -247,7 +295,7 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
             print('\n'.join(lines))
         return 1 if unknown_count else 0
     except Exception as exc:
-        print(_failure_message(exc, environ, session_token))
+        print(_failure_message(exc, environ, session_tokens))
         return 1
 
 

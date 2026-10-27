@@ -210,6 +210,28 @@ python hermes_alert.py --save-session
 `--public-cache-hours 0`으로 캐시를 끌 수 있습니다. 세션이 만료되면 좌석 없음으로
 판정하지 않고 오류 알림을 보내므로 브라우저에서 다시 로그인한 뒤 세션을 재등록하세요.
 
+#### Chrome에서 자동으로 가져오기
+
+DevTools에서 복사하는 대신, 원격 디버깅을 켠 전용 프로필 Chrome에서 스크립트가 직접
+`T`를 읽어올 수 있습니다(Chrome DevTools Protocol). Chrome 136부터 기본 프로필에서는
+원격 디버깅이 무시되므로 `--user-data-dir`로 전용 프로필을 지정해야 합니다.
+
+```bash
+google-chrome --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/.config/korean-air-chrome" https://www.koreanair.com/login
+# 그 창에서 한 번 로그인한 뒤
+python hermes_alert.py --grab-session            # 기본 http://127.0.0.1:9222
+```
+
+launcher의 `CDP_URL`(또는 `KOREANAIR_CDP_URL` + `env_passthrough`)을 설정하면
+cron은 세션 파일의 `T`가 만료됐을 때 그 Chrome에서 `T`를 다시 가져와 재시도하고,
+갱신에 성공할 때마다 회전된 `T`를 Chrome에도 다시 써 넣어 브라우저 세션도 함께
+유지합니다(실패해도 무시). Chrome을 계속 실행해 두어야 하며, Chrome 쪽 세션까지
+만료되면 오류 알림이 가므로 그 창에서 다시 로그인하세요.
+
+원격 디버깅 포트는 그 브라우저 프로필 전체를 제어할 수 있습니다. 기본값인 127.0.0.1에만
+두고 외부에 노출하지 마세요.
+
 `T`는 로그인 세션과 동등한 비밀정보입니다. 세션 파일은 권한 0600으로 저장되지만,
 토큰을 저장소에 커밋하거나 로그에 남기거나 다른 사람과 공유하지 마세요.
 연속 갱신 시 세션의 최대 수명이 얼마나 되는지는 아직 확인되지 않았습니다.

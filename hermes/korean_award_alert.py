@@ -6,10 +6,13 @@ import sys
 # 세션 쿠키 등록은 README의 "세션 쿠키 모드 (권장)"을 참고하세요.
 REPO = Path('~/repos/korean_air_alert').expanduser()
 ROUTES = ['ICN-JFK', 'JFK-ICN']
+# 예: 'http://127.0.0.1:9222' — 세션 만료 시 이 Chrome에서 T를 다시 가져옵니다.
+CDP_URL = ''
 
 sys.path.insert(0, str(REPO))
 import hermes_alert
 
-raise SystemExit(hermes_alert.run([
-    argument for route in ROUTES for argument in ('--route', route)
-]))
+args = [argument for route in ROUTES for argument in ('--route', route)]
+if CDP_URL:
+    args += ['--cdp', CDP_URL]
+raise SystemExit(hermes_alert.run(args))

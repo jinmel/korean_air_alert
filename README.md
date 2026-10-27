@@ -140,6 +140,48 @@ unset KOREANAIR_USERNAME KOREANAIR_PASSWORD
 403 상태 진단과 비밀정보 비노출, 날짜/노선/등급 일치 및 매진/미확인 구분을 확인합니다.
 이 검증은 해당 실행 시점·계정·노선에 한정되며, 항공사의 접근 정책과 응답 구조가 바뀌면 수정이 필요할 수 있습니다.
 
+## Hermes Agent cron 알림
+
+Hermes의 `--no-agent --script` 실행은 스크립트의 stdout(앞뒤 공백 제거)을 그대로
+알림으로 전달합니다. stdout이 비어 있으면 조용한 실행이며, 0이 아닌 종료 코드나
+시간 초과는 오류 알림으로 전달됩니다. 스크립트 파일은 `$HERMES_HOME/scripts/` 안에
+있어야 하고 CLI 인수를 전달할 수 없으므로 이 저장소의 launcher에 노선과 clone 경로를
+설정합니다. Hermes가 인식하는 Python을 사용하며, 필요하면 `--interpreter`로 고정할 수 있습니다.
+
+```bash
+cp hermes/korean_award_alert.py ~/.hermes/scripts/
+```
+
+복사한 `~/.hermes/scripts/korean_award_alert.py`에서 `REPO`를 clone 경로로,
+`ROUTES`를 확인할 노선 목록으로 수정합니다. Hermes profile의 `config.yaml`에서
+환경 변수 전달을 허용합니다.
+
+```yaml
+terminal:
+  env_passthrough:
+    - KOREANAIR_USERNAME
+    - KOREANAIR_PASSWORD
+    - KOREANAIR_LOGIN_TYPE
+```
+
+해당 profile의 `.env` 파일에 `KOREANAIR_USERNAME`, `KOREANAIR_PASSWORD`를 설정하고,
+필요하면 `KOREANAIR_LOGIN_TYPE=id` 또는 `skypass`를 추가합니다. Hermes는 subprocess
+환경을 정리하므로 이 설정 없이는 로그인 정보가 스크립트에 전달되지 않습니다.
+
+```bash
+hermes cron create "every 3h" --no-agent --script korean_award_alert.py --deliver telegram --name korean-award-alert
+hermes cron run <job_id>
+```
+
+`--deliver telegram`은 예시입니다. 사용 가능한 Hermes 전달 옵션으로 바꿀 수 있습니다.
+상태 파일 기본 위치는 `~/.local/state/korean_air_alert/hermes_seen.json`이며,
+`KOREANAIR_ALERT_STATE` 또는 `--state`로 변경할 수 있습니다. 선택 가능한 상태가
+새로 나타났을 때만 알림을 보내며, 공개 현황은 하루 한 번 업데이트되므로 일정보다
+훨씬 자주 실행해도 후보 발견에는 도움이 되지 않습니다.
+
+Python urllib 로그인이 실행 환경에 따라 Akamai에 의해 거부될 수 있으며(예: HTTP 428),
+그 경우 좌석 없음으로 잘못 알리지 않고 작업 실패 오류 알림을 보냅니다.
+
 ## 추가 확인 도구
 
 프로젝트 루트에서 실행합니다. 환경 변수가 없으면 로그인 정보를 비표시 터미널 입력으로 받습니다.

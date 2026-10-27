@@ -1,11 +1,44 @@
 import unittest
 import json
 import threading
+import io
+from contextlib import redirect_stdout
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import date
+from datetime import date, timedelta
+from unittest.mock import patch
 
-from korean_award import AwardClient, LOGIN_PATH, LIVE_PATH, extract, live_result, login_settings, month_start, next_month
+from korean_award import (
+    AwardClient, LOGIN_PATH, LIVE_PATH, extract, find_candidates, live_result,
+    login_settings, month_start, next_month, query_window,
+)
+
+
+class HelperTests(unittest.TestCase):
+    def test_query_window_validation_messages(self):
+        today = date(2027, 10, 22)
+        with self.assertRaisesRegex(ValueError, '일수는 1 이상이어야 합니다.'):
+            query_window(today, days=0)
+        with self.assertRaisesRegex(ValueError, '시작 월이 조회 기간 밖입니다.'):
+            query_window(today, month='2027-09')
+
+    def test_find_candidates_without_output_is_silent(self):
+        class Client:
+            def fetch_month(self, origin, destination, month):
+                return {'flightList': [{'departureDate': '20271022',
+                                        'flightDetailList': [{
+                                            'bookingClass': 'O',
+                                            'availableSeat': False,
+                                        }]}]}
+
+        output = io.StringIO()
+        with patch('korean_award.time.sleep'), redirect_stdout(output):
+            rows, completed = find_candidates(
+                Client(), 'ICN', 'JFK', date(2027, 10, 1),
+                date(2027, 10, 22), date(2027, 10, 22))
+        self.assertEqual(rows, [])
+        self.assertEqual(completed, 1)
+        self.assertEqual(output.getvalue(), '')
 
 
 class CalendarTests(unittest.TestCase):

@@ -175,6 +175,76 @@ def live_result(payload, origin, destination, row):
     return '미확인: 예매 검색 응답 해석 불가', None
 
 
+def query_window(today, month=None, until=None, days=360):
+    if days < 1:
+        raise ValueError('일수는 1 이상이어야 합니다.')
+    try:
+        first = month_start(month or today.strftime('%Y-%m'))
+        limit = today + timedelta(days=days)
+        if until:
+            end_month = month_start(until)
+            limit = min(limit, end_month.replace(
+                day=calendar.monthrange(end_month.year, end_month.month)[1]))
+    except OverflowError as exc:
+        raise ValueError(str(exc)) from None
+    if first < today.replace(day=1) or first > limit:
+        raise ValueError('시작 월이 조회 기간 밖입니다.')
+    return first, max(today, first), limit
+
+
+def find_candidates(client, origin, destination, first, start, limit, out=None):
+    current = first
+    candidates = []
+    completed = 0
+    while current <= limit:
+        try:
+            payload = client.fetch_month(origin, destination, current)
+            end = min(limit, current.replace(
+                day=calendar.monthrange(current.year, current.month)[1]))
+            rows = extract(payload, max(start, current), end)
+        except Exception as exc:
+            raise RuntimeError(f'{current:%Y-%m} 조회 미완료: {exc}') from exc
+        if callable(out):
+            out(f'\n[{current:%Y-%m}]')
+            for row in rows:
+                out('\t'.join(row))
+            if not rows:
+                out('대상 기간의 O/A 보너스 좌석 표시 없음')
+        candidates.extend(rows)
+        completed += 1
+        current = next_month(current)
+        if current <= limit:
+            time.sleep(2)
+    return candidates, completed
+
+
+def verify_candidates(client, origin, destination, candidates, out=None):
+    checked_dates = {}
+    results = []
+    for row in candidates:
+        if row[0] not in checked_dates:
+            if checked_dates:
+                time.sleep(2)
+            day = date.fromisoformat(row[0])
+            try:
+                checked_dates[row[0]] = client.fetch_live(origin, destination, day)
+            except RuntimeError:
+                if callable(out):
+                    out(f'{row[0]}: 조회 실패. 이후 실시간 검증을 중단합니다.')
+                raise
+        try:
+            status, seats = live_result(
+                checked_dates[row[0]], origin, destination, row)
+        except (ValueError, TypeError, KeyError, IndexError):
+            status, seats = '미확인: 예매 검색 응답 해석 실패', None
+        results.append((row, status, seats))
+        if callable(out):
+            stamp = datetime.now(KST).isoformat(timespec='seconds')
+            count = f' / 응답 좌석 수 {seats}' if seats is not None else ''
+            out('\t'.join(row) + f'\t{status}{count} / 확인 {stamp}')
+    return results
+
+
 class AwardClient:
     """Normal HTTP session; cookies remain in memory and proxies are inherited."""
 
@@ -305,42 +375,18 @@ def main():
             parser.error(str(exc))
     today = datetime.now(KST).date()
     try:
-        if args.days < 1:
-            raise ValueError('일수는 1 이상이어야 합니다.')
-        first = month_start(args.month or today.strftime('%Y-%m'))
-        limit = today + timedelta(days=args.days)
-        if args.until:
-            until = month_start(args.until)
-            limit = min(limit, until.replace(day=calendar.monthrange(until.year, until.month)[1]))
-        if first < today.replace(day=1) or first > limit:
-            raise ValueError('시작 월이 조회 기간 밖입니다.')
+        first, start, limit = query_window(
+            today, args.month, args.until, args.days)
     except (ValueError, OverflowError) as exc:
         parser.error(str(exc))
 
-    start = max(today, first)
     print(f'{args.origin} → {args.destination}: {start} ~ {limit} (한국 시간)', flush=True)
     client = AwardClient()
     client.initialize()
-    current, total, completed = first, 0, 0
-    candidates = []
-    while current <= limit:
-        try:
-            payload = client.fetch_month(args.origin, args.destination, current)
-            end = min(limit, current.replace(day=calendar.monthrange(current.year, current.month)[1]))
-            rows = extract(payload, max(start, current), end)
-        except Exception as exc:
-            raise RuntimeError(f'{current:%Y-%m} 조회 미완료: {exc}') from exc
-        print(f'\n[{current:%Y-%m}]', flush=True)
-        for row in rows:
-            print('\t'.join(row), flush=True)
-        if not rows:
-            print('대상 기간의 O/A 보너스 좌석 표시 없음', flush=True)
-        candidates.extend(rows)
-        total += len(rows)
-        completed += 1
-        current = next_month(current)
-        if current <= limit:
-            time.sleep(2)
+    candidates, completed = find_candidates(
+        client, args.origin, args.destination, first, start, limit,
+        out=lambda line: print(line, flush=True))
+    total = len(candidates)
     print(f'완료: {completed}개월, {total}건 (좌석 수가 아닌 항공편·등급별 표시 건수)')
     if not args.verify_live:
         print('공개 현황이며 최종 예약 가능 여부는 예매 화면에서 확인하세요.')
@@ -350,28 +396,11 @@ def main():
         return
     print('\n실제 예매 검색 재확인: 로그인한 본인 성인 1명', flush=True)
     client.login_from_env()
-    checked_dates = {}
-    incomplete = False
-    for row in candidates:
-        if row[0] not in checked_dates:
-            if checked_dates:
-                time.sleep(2)
-            try:
-                checked_dates[row[0]] = client.fetch_live(
-                    args.origin, args.destination, date.fromisoformat(row[0]))
-            except RuntimeError:
-                print(f'{row[0]}: 조회 실패. 이후 실시간 검증을 중단합니다.', flush=True)
-                raise
-        try:
-            status, seats = live_result(checked_dates[row[0]], args.origin, args.destination, row)
-        except (ValueError, TypeError, KeyError, IndexError):
-            status, seats = '미확인: 예매 검색 응답 해석 실패', None
-        incomplete |= status.startswith('미확인')
-        stamp = datetime.now(KST).isoformat(timespec='seconds')
-        count = f' / 응답 좌석 수 {seats}' if seats is not None else ''
-        print('\t'.join(row) + f'\t{status}{count} / 확인 {stamp}', flush=True)
+    results = verify_candidates(
+        client, args.origin, args.destination, candidates,
+        out=lambda line: print(line, flush=True))
     print('결과는 예매 검색 시점의 상태입니다. 좌석 확보·예약 생성·결제는 하지 않습니다.')
-    if incomplete:
+    if any(status.startswith('미확인') for _, status, _ in results):
         raise RuntimeError('일부 후보의 실시간 상태를 확인하지 못했습니다. 미확인을 좌석 없음으로 판단하지 마세요.')
 
 

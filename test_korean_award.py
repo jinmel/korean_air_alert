@@ -1,10 +1,11 @@
 import unittest
 import json
 import threading
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import date
 
-from korean_award import AwardClient, extract, month_start, next_month
+from korean_award import AwardClient, LOGIN_PATH, LIVE_PATH, extract, live_result, login_settings, month_start, next_month
 
 
 class CalendarTests(unittest.TestCase):
@@ -36,6 +37,77 @@ class CalendarTests(unittest.TestCase):
                 extract(payload, date(2026, 10, 27), date(2026, 10, 31))
 
 
+LIVE_ROW = ('2027-10-22', 'KE081', '10:00', '프레스티지석 보너스')
+
+
+def live_fixture(count='2'):
+    # Shape and selection fields taken from the official site's public JS,
+    # not a captured authenticated production response.
+    return {'upsellBoundAvailList': [{'availFlightList': [{
+        'flightInfoList': [{'carrierCode': 'KE', 'flightNumber': '81',
+                           'departureAirport': 'ICN', 'arrivalAirport': 'JFK',
+                           'departureDateTime': '202710221000'}],
+        'commercialFareFamilyList': [{'fareFamily': 'KEBONUSPR', 'bookingClass': 'O',
+                                     'seatCount': count, 'recommendId': 'test-offer',
+                                     'soldout': False}],
+    }]}]}
+
+
+class LiveResultTests(unittest.TestCase):
+    def check(self, payload):
+        return live_result(payload, 'ICN', 'JFK', LIVE_ROW)
+
+    def test_positive_matching_award_is_selectable(self):
+        self.assertEqual(self.check(live_fixture()), ('예매 검색에서 선택 가능', 2))
+
+    def test_zero_or_disabled_not_selectable(self):
+        for count in ('0', ''):
+            with self.subTest(count=count):
+                self.assertEqual(self.check(live_fixture(count))[0], '예매 검색에서 선택 불가')
+
+    def test_soldout_overrides_positive_count(self):
+        payload = live_fixture()
+        payload['upsellBoundAvailList'][0]['availFlightList'][0]['commercialFareFamilyList'][0]['soldout'] = True
+        self.assertEqual(self.check(payload)[0], '예매 검색에서 선택 불가')
+
+    def test_unknown_seat_count_is_not_confirmation(self):
+        for count in (None, True, 'unknown', '9+', -1):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                self.check(live_fixture(count))
+
+    def test_wrong_date_or_route_rejected(self):
+        for field, value in (('departureDateTime', '202710231000'), ('arrivalAirport', 'LAX')):
+            payload = live_fixture()
+            payload['upsellBoundAvailList'][0]['availFlightList'][0]['flightInfoList'][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.check(payload)
+
+    def test_login_error_or_changed_schema_never_means_no_seats(self):
+        for payload in ({'errors': ['expired']}, {'code': 'AUTH'}, {'data': []}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.check(payload)
+
+    def test_missing_flight_or_fare_is_unknown(self):
+        payload = live_fixture()
+        payload['upsellBoundAvailList'][0]['availFlightList'] = []
+        self.assertTrue(self.check(payload)[0].startswith('미확인'))
+        payload = live_fixture()
+        payload['upsellBoundAvailList'][0]['availFlightList'][0]['commercialFareFamilyList'][0]['fareFamily'] = 'KEBONUSEY'
+        self.assertTrue(self.check(payload)[0].startswith('미확인'))
+
+    def test_cash_or_upgrade_class_never_confirmed_as_award(self):
+        payload = live_fixture()
+        payload['upsellBoundAvailList'][0]['availFlightList'][0]['commercialFareFamilyList'][0]['bookingClass'] = 'Z'
+        with self.assertRaises(ValueError):
+            self.check(payload)
+
+    def test_missing_offer_id_is_not_selectable(self):
+        payload = live_fixture()
+        payload['upsellBoundAvailList'][0]['availFlightList'][0]['commercialFareFamilyList'][0]['recommendId'] = ''
+        with self.assertRaises(ValueError):
+            self.check(payload)
+
+
 class HTTPTests(unittest.TestCase):
     def setUp(self):
         class Handler(BaseHTTPRequestHandler):
@@ -51,6 +123,30 @@ class HTTPTests(unittest.TestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 self.server.last_body = body
+                if self.path == LOGIN_PATH:
+                    self.server.login_calls += 1
+                    self.server.login_body = deepcopy(body)
+                    self.send_response(200)
+                    if self.server.mode != 'login-fail':
+                        self.send_header('Set-Cookie', 'auth-test=1; Path=/; HttpOnly')
+                    self.end_headers()
+                    if self.server.mode == 'login-fail':
+                        self.wfile.write(json.dumps({'code': 'AUTH_FAIL', 'message': body['password']}).encode())
+                    else:
+                        self.wfile.write(json.dumps({'userInfo': {
+                            'skypassNumber': 'TEST-ACCOUNT', 'englishFirstName': 'TEST',
+                            'englishLastName': 'USER'}}).encode())
+                    return
+                if self.path == LIVE_PATH:
+                    if 'auth-test=1' not in self.headers.get('Cookie', ''):
+                        self.send_response(401)
+                        self.end_headers()
+                        return
+                    self.server.live_calls += 1
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps(live_fixture()).encode())
+                    return
                 if self.headers.get('Cookie') != 'award-test=1' or self.server.mode == 'denied':
                     self.send_response(403)
                     self.end_headers()
@@ -70,6 +166,8 @@ class HTTPTests(unittest.TestCase):
 
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.server.mode = 'ok'
+        self.server.login_calls = 0
+        self.server.live_calls = 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.client = AwardClient(f'http://127.0.0.1:{self.server.server_port}')
@@ -107,6 +205,46 @@ class HTTPTests(unittest.TestCase):
         self.server.mode = 'wrong-route'
         with self.assertRaisesRegex(ValueError, '노선'):
             self.client.fetch_month('ICN', 'JFK', date(2027, 1, 1))
+
+
+    def test_env_credentials_login_and_read_only_search(self):
+        self.client.initialize()
+        self.client.login_from_env({'KOREANAIR_USERNAME': 'test-id', 'KOREANAIR_PASSWORD': 'test-password'})
+        self.assertEqual(self.server.login_body, {'userId': 'test-id', 'password': 'test-password'})
+        result = self.client.fetch_live('ICN', 'JFK', date(2027, 10, 22))
+        self.assertEqual(live_result(result, 'ICN', 'JFK', LIVE_ROW)[0], '예매 검색에서 선택 가능')
+        self.assertEqual(self.server.live_calls, 1)
+        self.assertEqual(self.server.last_body['segmentList'][0]['departureDate'], '20271022')
+        self.assertEqual(self.server.last_body['commercialFareFamilies'], ['KEBONUSNEW'])
+        self.assertEqual(len(self.server.last_body['travelers']), 1)
+        self.assertNotIn('password', self.server.last_body)
+
+    def test_skypass_login_type(self):
+        self.client.initialize()
+        self.client.login_from_env({'KOREANAIR_USERNAME': 'test-skypass',
+                                    'KOREANAIR_PASSWORD': 'test-password', 'KOREANAIR_LOGIN_TYPE': 'skypass'})
+        self.assertEqual(self.server.login_body['skypassNumber'], 'test-skypass')
+        self.assertNotIn('userId', self.server.login_body)
+
+    def test_missing_credentials_do_not_attempt_login(self):
+        with self.assertRaisesRegex(ValueError, '환경 변수'):
+            self.client.login_from_env({})
+        self.assertEqual(self.server.login_calls, 0)
+
+    def test_login_failure_does_not_echo_password_or_retry(self):
+        self.client.initialize()
+        self.server.mode = 'login-fail'
+        with self.assertRaises(RuntimeError) as caught:
+            self.client.login_from_env({'KOREANAIR_USERNAME': 'private-id', 'KOREANAIR_PASSWORD': 'private-password'})
+        self.assertNotIn('private-password', str(caught.exception))
+        self.assertNotIn('private-id', str(caught.exception))
+        self.assertEqual(self.server.login_calls, 1)
+        self.assertIsNone(self.client.traveler)
+
+    def test_live_search_requires_login(self):
+        with self.assertRaisesRegex(RuntimeError, '로그인'):
+            self.client.fetch_live('ICN', 'JFK', date(2027, 10, 22))
+        self.assertEqual(self.server.live_calls, 0)
 
 
 if __name__ == '__main__':

@@ -153,7 +153,10 @@ cp hermes/korean_award_alert.py ~/.hermes/scripts/
 ```
 
 복사한 `~/.hermes/scripts/korean_award_alert.py`에서 `REPO`를 clone 경로로,
-`ROUTES`를 확인할 노선 목록으로 수정합니다. Hermes profile의 `config.yaml`에서
+`ROUTES`를 확인할 노선 목록으로 수정합니다. 기본값은 대한항공 ICN 출발 미주 노선
+13개(JFK, LAX, SFO, SEA, LAS, HNL, ATL, ORD, DFW, IAD, BOS, YVR, YYZ)와 JFK→ICN입니다.
+공개 현황 캐시가 만료된 실행은 노선마다 13개월을 2초 간격으로 조회하므로 수 분이
+걸립니다(Hermes 스크립트 기본 제한 시간 1시간). Hermes profile의 `config.yaml`에서
 환경 변수 전달을 허용합니다.
 
 ```yaml

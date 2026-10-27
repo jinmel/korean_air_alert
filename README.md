@@ -162,6 +162,8 @@ terminal:
     - KOREANAIR_USERNAME
     - KOREANAIR_PASSWORD
     - KOREANAIR_LOGIN_TYPE
+    - KOREANAIR_SESSION_T
+    - KOREANAIR_SESSION_FILE
 ```
 
 해당 profile의 `.env` 파일에 `KOREANAIR_USERNAME`, `KOREANAIR_PASSWORD`를 설정하고,
@@ -169,7 +171,7 @@ terminal:
 환경을 정리하므로 이 설정 없이는 로그인 정보가 스크립트에 전달되지 않습니다.
 
 ```bash
-hermes cron create "every 3h" --no-agent --script korean_award_alert.py --deliver telegram --name korean-award-alert
+hermes cron create "every 20m" --no-agent --script korean_award_alert.py --deliver telegram --name korean-award-alert
 hermes cron run <job_id>
 ```
 
@@ -181,6 +183,36 @@ hermes cron run <job_id>
 
 Python urllib 로그인이 실행 환경에 따라 Akamai에 의해 거부될 수 있으며(예: HTTP 428),
 그 경우 좌석 없음으로 잘못 알리지 않고 작업 실패 오류 알림을 보냅니다.
+
+### 세션 쿠키 모드 (권장)
+
+urllib의 `signIn` 로그인이 Akamai HTTP 428로 거부되는 환경에서는 브라우저 로그인 세션의
+쿠키 `T`를 사용할 수 있습니다. `koreanair.com`에 로그인한 뒤 개발자 도구의
+**Application → Cookies → `https://www.koreanair.com`**에서 `T` 값을 복사합니다.
+`T`는 HttpOnly 쿠키이므로 `document.cookie`에는 표시되지 않습니다.
+
+저장소 루트에서 대화형으로 쿠키를 등록합니다. Hermes와 동일한 `HOME` 및 상태 경로로
+실행해야 이후 cron job이 같은 세션 파일을 사용합니다.
+
+```bash
+python hermes_alert.py --save-session
+```
+
+또는 `KOREANAIR_SESSION_T`를 설정해 세션 파일이 아직 없을 때 초기 토큰으로 전달할 수
+있습니다. 이 환경 변수를 사용할 때는 profile `config.yaml`의 `terminal.env_passthrough`
+및 해당 profile의 `.env`에 추가합니다. 세션 파일 기본 위치는
+`~/.local/state/korean_air_alert/session.json`이며 `--session` 또는
+`KOREANAIR_SESSION_FILE`로 변경할 수 있습니다. 각 정상 실행은 검색 전에 세션을
+갱신하고 회전된 쿠키를 저장합니다.
+
+관찰된 세션 쿠키 TTL은 40분 슬라이딩 방식이므로 작업 간격은 40분 미만이어야 합니다.
+`every 20m` 실행을 권장합니다. 공개 현황은 기본 3시간 캐시를 사용하며,
+`--public-cache-hours 0`으로 캐시를 끌 수 있습니다. 세션이 만료되면 좌석 없음으로
+판정하지 않고 오류 알림을 보내므로 브라우저에서 다시 로그인한 뒤 세션을 재등록하세요.
+
+`T`는 로그인 세션과 동등한 비밀정보입니다. 세션 파일은 권한 0600으로 저장되지만,
+토큰을 저장소에 커밋하거나 로그에 남기거나 다른 사람과 공유하지 마세요.
+연속 갱신 시 세션의 최대 수명이 얼마나 되는지는 아직 확인되지 않았습니다.
 
 ## 추가 확인 도구
 

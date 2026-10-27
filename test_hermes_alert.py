@@ -4,7 +4,7 @@ import stat
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,13 +21,23 @@ CREDS = {
 
 
 class FakeClient:
-    def __init__(self, login_error=None):
+    def __init__(self, login_error=None, session_error=None,
+                 rotated_token='rotated-session-token'):
         self.login_error = login_error
+        self.session_error = session_error
+        self.rotated_token = rotated_token
         self.initialize_calls = 0
         self.login_calls = 0
+        self.session_calls = []
 
     def initialize(self):
         self.initialize_calls += 1
+
+    def login_from_session(self, token):
+        self.session_calls.append(token)
+        if self.session_error:
+            raise self.session_error
+        return self.rotated_token
 
     def login_from_env(self, environ):
         self.login_calls += 1
@@ -42,22 +52,30 @@ class HermesAlertTests(unittest.TestCase):
         self.state_path = Path(self.directory.name) / 'state' / 'seen.json'
 
     def run_alert(self, candidates=None, results=None, client=None, environ=None,
-                  route=ROUTE):
+                  route=ROUTE, session_file=None, extra_args=(), now=None,
+                  lookup_calls=None):
         client = client or FakeClient()
         candidates = candidates or {}
         results = results or {}
-        lookup = lambda _client, origin, destination, *_args, **_kwargs: (
-            candidates.get(f'{origin}-{destination}', []), 1)
+
+        def lookup(_client, origin, destination, *_args, **_kwargs):
+            if lookup_calls is not None:
+                lookup_calls.append(f'{origin}-{destination}')
+            return candidates.get(f'{origin}-{destination}', []), 1
+
         verify = lambda _client, origin, destination, rows: results.get(
             f'{origin}-{destination}', [])
         output = io.StringIO()
+        argv = ['--route', route, *extra_args]
+        if session_file is not None:
+            argv.extend(('--session', str(session_file)))
         with (patch('hermes_alert.find_candidates', side_effect=lookup),
               patch('hermes_alert.verify_candidates', side_effect=verify),
               redirect_stdout(output)):
             result = hermes_alert.run(
-                ['--route', route], environ=CREDS if environ is None else environ,
+                argv, environ=CREDS if environ is None else environ,
                 client_factory=lambda: client, state_path=self.state_path,
-                now=datetime(2027, 10, 22, 9, 0, tzinfo=KST))
+                now=now or datetime(2027, 10, 22, 9, 0, tzinfo=KST))
         return result, output.getvalue(), client
 
     def test_no_candidates_is_silent_and_does_not_log_in(self):
@@ -65,6 +83,7 @@ class HermesAlertTests(unittest.TestCase):
         self.assertEqual((result, output), (0, ''))
         self.assertEqual(client.login_calls, 0)
         self.assertEqual(json.loads(self.state_path.read_text())['selectable'], {})
+        self.assertEqual(json.loads(self.state_path.read_text())['public'][ROUTE]['rows'], [])
 
     def test_candidates_that_are_not_selectable_are_silent(self):
         result, output, client = self.run_alert(
@@ -140,6 +159,104 @@ class HermesAlertTests(unittest.TestCase):
                 client_factory=FakeClient, state_path=self.state_path)
         self.assertEqual(caught.exception.code, 2)
         self.assertIn('--route', stderr.getvalue())
+
+    def test_session_refresh_is_saved_even_without_candidates(self):
+        session_file = Path(self.directory.name) / 'session.json'
+        session_file.write_text(json.dumps({'T': 'old-session-token'}))
+        client = FakeClient()
+        result, output, client = self.run_alert(
+            client=client, environ={}, session_file=session_file)
+        self.assertEqual((result, output), (0, ''))
+        self.assertEqual(client.session_calls, ['old-session-token'])
+        self.assertEqual(json.loads(session_file.read_text())['T'], client.rotated_token)
+        self.assertEqual(stat.S_IMODE(session_file.stat().st_mode), 0o600)
+
+    def test_expired_session_leaves_alert_state_unchanged(self):
+        self.state_path.parent.mkdir(parents=True)
+        original = '{"selectable":{"old":{"first_seen":"then","seats":1}},"public":{}}\n'
+        self.state_path.write_text(original)
+        session_file = Path(self.directory.name) / 'session.json'
+        session_file.write_text(json.dumps({'T': 'expired-private-token'}))
+        result, output, _ = self.run_alert(
+            client=FakeClient(session_error=RuntimeError(
+                '세션 만료 expired-private-token')),
+            environ={}, session_file=session_file)
+        self.assertEqual(result, 1)
+        self.assertIn('대한항공 보너스 알림 실패:', output)
+        self.assertNotIn('expired-private-token', output)
+        self.assertEqual(self.state_path.read_text(), original)
+
+    def test_environment_token_seeds_missing_session_file(self):
+        session_file = Path(self.directory.name) / 'session.json'
+        result, output, client = self.run_alert(
+            environ={'KOREANAIR_SESSION_T': 'environment-session-token'},
+            session_file=session_file)
+        self.assertEqual((result, output), (0, ''))
+        self.assertEqual(client.session_calls, ['environment-session-token'])
+        self.assertEqual(json.loads(session_file.read_text())['T'],
+                         'rotated-session-token')
+
+    def test_save_session_success_and_failure(self):
+        session_file = Path(self.directory.name) / 'session.json'
+        client = FakeClient()
+        output = io.StringIO()
+        with (patch('hermes_alert.getpass.getpass',
+                    return_value=' typed-session-token \n'),
+              redirect_stdout(output)):
+            result = hermes_alert.run(
+                ['--save-session', '--session', str(session_file)],
+                environ={}, client_factory=lambda: client,
+                now=datetime(2027, 10, 22, 9, 0, tzinfo=KST))
+        self.assertEqual(result, 0)
+        self.assertIn('세션 저장 완료 (확인 2027-10-22T09:00:00+09:00)', output.getvalue())
+        self.assertEqual(client.session_calls, ['typed-session-token'])
+        self.assertEqual(json.loads(session_file.read_text())['T'], client.rotated_token)
+        self.assertEqual(stat.S_IMODE(session_file.stat().st_mode), 0o600)
+
+        failed_file = Path(self.directory.name) / 'failed-session.json'
+        failed_client = FakeClient(session_error=RuntimeError(
+            '세션 만료 one-time-private-token'))
+        output = io.StringIO()
+        with (patch('hermes_alert.getpass.getpass',
+                    return_value='one-time-private-token'),
+              redirect_stdout(output)):
+            result = hermes_alert.run(
+                ['--save-session', '--session', str(failed_file)],
+                environ={}, client_factory=lambda: failed_client,
+                now=datetime(2027, 10, 22, 9, 0, tzinfo=KST))
+        self.assertEqual(result, 1)
+        self.assertIn('대한항공 보너스 알림 실패:', output.getvalue())
+        self.assertNotIn('one-time-private-token', output.getvalue())
+        self.assertFalse(failed_file.exists())
+
+    def test_public_cache_skips_scan_until_expired_or_disabled(self):
+        calls = []
+        self.run_alert(lookup_calls=calls)
+        self.run_alert(lookup_calls=calls)
+        self.assertEqual(calls, [ROUTE])
+
+        later = datetime(2027, 10, 22, 13, 0, tzinfo=KST)
+        self.run_alert(lookup_calls=calls, now=later)
+        self.assertEqual(calls, [ROUTE, ROUTE])
+
+        self.run_alert(lookup_calls=calls, now=later,
+                       extra_args=('--public-cache-hours', '0'))
+        self.assertEqual(calls, [ROUTE, ROUTE, ROUTE])
+
+    def test_public_cache_rescans_when_window_start_changes(self):
+        calls = []
+        hours = ('--public-cache-hours', '48')
+        self.run_alert(lookup_calls=calls, extra_args=hours)
+        next_day = datetime(2027, 10, 23, 9, 0, tzinfo=KST)
+        self.run_alert(lookup_calls=calls, extra_args=hours, now=next_day)
+        self.assertEqual(calls, [ROUTE, ROUTE])
+
+    def test_old_state_without_public_cache_is_supported(self):
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text('{"selectable":{}}\n')
+        result, output, _ = self.run_alert()
+        self.assertEqual((result, output), (0, ''))
+        self.assertIn('public', json.loads(self.state_path.read_text()))
 
 
 if __name__ == '__main__':

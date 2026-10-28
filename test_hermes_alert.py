@@ -3,7 +3,7 @@ import json
 import stat
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +29,7 @@ class FakeClient:
         self.initialize_calls = 0
         self.login_calls = 0
         self.session_calls = []
+        self.live_calls = []
 
     def initialize(self):
         self.initialize_calls += 1
@@ -43,6 +44,10 @@ class FakeClient:
         self.login_calls += 1
         if self.login_error:
             raise self.login_error
+
+    def fetch_live(self, origin, destination, day):
+        self.live_calls.append(day.isoformat())
+        return {'upsellBoundAvailList': [{'availFlightList': []}]}
 
 
 class SessionClient(FakeClient):
@@ -68,7 +73,7 @@ class HermesAlertTests(unittest.TestCase):
 
     def run_alert(self, candidates=None, results=None, client=None, environ=None,
                   route=ROUTE, session_file=None, extra_args=(), now=None,
-                  lookup_calls=None):
+                  lookup_calls=None, real_verification=False):
         client = client or FakeClient()
         candidates = candidates or {}
         results = results or {}
@@ -78,14 +83,19 @@ class HermesAlertTests(unittest.TestCase):
                 lookup_calls.append(f'{origin}-{destination}')
             return candidates.get(f'{origin}-{destination}', []), 1
 
-        verify = lambda _client, origin, destination, rows: results.get(
-            f'{origin}-{destination}', [])
+        def verify(_client, origin, destination, rows):
+            return results.get(f'{origin}-{destination}', [])
+
         output = io.StringIO()
         argv = ['--route', route, *extra_args]
         if session_file is not None:
             argv.extend(('--session', str(session_file)))
+        verification_patch = (
+            nullcontext() if real_verification
+            else patch('hermes_alert.verify_candidates', side_effect=verify))
         with (patch('hermes_alert.find_candidates', side_effect=lookup),
-              patch('hermes_alert.verify_candidates', side_effect=verify),
+              verification_patch,
+              patch('korean_award.time.sleep'),
               redirect_stdout(output)):
             result = hermes_alert.run(
                 argv, environ=CREDS if environ is None else environ,
@@ -174,6 +184,53 @@ class HermesAlertTests(unittest.TestCase):
                 client_factory=FakeClient, state_path=self.state_path)
         self.assertEqual(caught.exception.code, 2)
         self.assertIn('--route', stderr.getvalue())
+
+    def test_earliest_dates_preserves_original_row_order(self):
+        rows = [
+            ('2027-10-25', 'KE085', '19:40', '일등석 보너스'),
+            ('2027-10-21', 'KE081', '10:00', '프레스티지석 보너스'),
+            ('2027-10-23', 'KE083', '14:00', '프레스티지석 보너스'),
+            ('2027-10-21', 'KE087', '20:00', '일등석 보너스'),
+            ('2027-10-24', 'KE089', '22:00', '프레스티지석 보너스'),
+            ('2027-10-22', 'KE091', '08:00', '프레스티지석 보너스'),
+        ]
+        expected = [rows[1], rows[2], rows[3], rows[5]]
+        self.assertEqual(hermes_alert._earliest_dates(rows, 3), expected)
+        self.assertEqual(hermes_alert._earliest_dates(rows, 0), rows)
+
+    def test_live_dates_limits_verification_but_caches_all_public_rows(self):
+        rows = [
+            ('2027-10-24', 'KE085', '19:40', '일등석 보너스'),
+            ('2027-10-22', 'KE081', '10:00', '프레스티지석 보너스'),
+            ('2027-10-21', 'KE083', '14:00', '프레스티지석 보너스'),
+            ('2027-10-23', 'KE087', '20:00', '일등석 보너스'),
+            ('2027-10-22', 'KE089', '22:00', '프레스티지석 보너스'),
+        ]
+        client = FakeClient()
+        self.run_alert({ROUTE: rows}, client=client, real_verification=True)
+        self.assertEqual(len(client.live_calls), 3)
+        self.assertEqual(set(client.live_calls), {
+            '2027-10-21', '2027-10-22', '2027-10-23',
+        })
+        cached_rows = json.loads(self.state_path.read_text())['public'][ROUTE]['rows']
+        self.assertEqual(cached_rows, [list(row) for row in rows])
+
+        client.live_calls.clear()
+        self.run_alert(client=client, extra_args=('--live-dates', '0'),
+                       real_verification=True)
+        self.assertEqual(len(client.live_calls), 4)
+        self.assertEqual(set(client.live_calls), {
+            '2027-10-21', '2027-10-22', '2027-10-23', '2027-10-24',
+        })
+
+    def test_negative_live_dates_is_argparse_error(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            hermes_alert.run(
+                ['--route', ROUTE, '--live-dates', '-1'], environ={},
+                client_factory=FakeClient, state_path=self.state_path)
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('--live-dates', stderr.getvalue())
 
     def test_session_refresh_is_saved_even_without_candidates(self):
         session_file = Path(self.directory.name) / 'session.json'

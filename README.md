@@ -157,7 +157,9 @@ cp hermes/korean_award_alert.py ~/.hermes/scripts/
 13개(JFK, LAX, SFO, SEA, LAS, HNL, ATL, ORD, DFW, IAD, BOS, YVR, YYZ)와 JFK→ICN입니다.
 공개 현황 캐시가 만료된 실행은 노선마다 13개월을 2초 간격으로 조회하므로 수 분이
 걸립니다(Hermes 스크립트 기본 제한 시간 1시간). Hermes profile의 `config.yaml`에서
-환경 변수 전달을 허용합니다.
+환경 변수 전달을 허용합니다. 예매 검색은 기본적으로 노선별 가장 이른 3개 출발 날짜의
+후보만 실시간 확인하며, `--live-dates`로 조정할 수 있습니다(0은 전체 날짜, 14개 노선이면
+최대 42회 예매 검색).
 
 ```yaml
 terminal:

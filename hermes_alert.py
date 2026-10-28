@@ -107,6 +107,13 @@ def _cache_is_fresh(entry, checked_at, start, hours):
     return timedelta(0) <= age < timedelta(hours=hours)
 
 
+def _earliest_dates(rows, count):
+    if count == 0:
+        return list(rows)
+    dates = set(sorted({row[0] for row in rows})[:count])
+    return [row for row in rows if row[0] in dates]
+
+
 def _failure_message(exc, environ, session_tokens=()):
     message = str(exc).splitlines()[0].strip() if str(exc).splitlines() else ''
     secrets = [environ.get(name) for name in (
@@ -173,6 +180,8 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
                         f'예: {DEFAULT_CDP_URL}')
     parser.add_argument('--public-cache-hours', type=float, default=3,
                         help='공개 현황 캐시 시간 (기본: 3, 0은 비활성화)')
+    parser.add_argument('--live-dates', type=int, default=3,
+                        help='노선별로 예매 검색할 가장 이른 날짜 수 (기본: 3, 0=전체)')
     args = parser.parse_args(argv)
     routes = args.route or []
     for route in routes:
@@ -187,6 +196,8 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
         parser.error('--days는 1 이상이어야 합니다.')
     if not math.isfinite(args.public_cache_hours) or args.public_cache_hours < 0:
         parser.error('--public-cache-hours는 0 이상이어야 합니다.')
+    if args.live_dates < 0:
+        parser.error('--live-dates는 0 이상이어야 합니다.')
 
     environ = os.environ if environ is None else environ
     selected_state = (
@@ -238,11 +249,12 @@ def run(argv=None, environ=None, client_factory=AwardClient, state_path=None, no
             start_text = start.isoformat()
             entry = public.get(route)
             if _cache_is_fresh(entry, checked_at, start_text, args.public_cache_hours):
-                candidates_by_route[route] = _cache_rows(entry)
+                candidates_by_route[route] = _earliest_dates(
+                    _cache_rows(entry), args.live_dates)
                 continue
             rows = find_candidates(
                 client, origin, destination, first, start, limit, out=None)[0]
-            candidates_by_route[route] = rows
+            candidates_by_route[route] = _earliest_dates(rows, args.live_dates)
             public[route] = {
                 'fetched': stamp, 'start': start_text,
                 'rows': [list(row) for row in rows],

@@ -9,11 +9,14 @@ import http.cookiejar
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 
 URL = 'https://www.koreanair.com/booking/book-and-manage/award-seat-availability'
 API_PATH = '/api/hmp/bonusSeatView/bonusSeatView'
 LOGIN_PATH = '/api/li/auth/signIn'
+REFRESH_PATH = '/api/li/auth/refresh'
+USER_INFO_PATH = '/api/li/auth/loginUserInfo'
 LIVE_PATH = '/api/ap/booking/avail/awardAvailability'
 FARE_FAMILIES = {'프레스티지석 보너스': 'KEBONUSPR', '일등석 보너스': 'KEBONUSFC'}
 KST = timezone(timedelta(hours=9))
@@ -337,6 +340,50 @@ class AwardClient:
             raise RuntimeError('로그인 응답에서 본인 탑승객 정보를 확인하지 못했습니다.')
         self.traveler = {'travellerType': 'ADT', 'fqtvNumber': info['skypassNumber'],
                          'lastName': info['englishLastName'], 'firstName': info['englishFirstName']}
+
+    def login_from_session(self, token):
+        self.traveler = None
+        parsed_url = urlsplit(self.base_url)
+        host = parsed_url.hostname or ''
+        is_korean_air = host == 'koreanair.com' or host.endswith('.koreanair.com')
+        domain = '.koreanair.com' if is_korean_air else host
+        try:
+            if not isinstance(token, str) or not token.strip():
+                raise ValueError('세션 쿠키가 비어 있습니다.')
+            self.cookies.set_cookie(http.cookiejar.Cookie(
+                version=0, name='T', value=token, port=None, port_specified=False,
+                domain=domain, domain_specified=is_korean_air,
+                domain_initial_dot=domain.startswith('.'), path='/', path_specified=True,
+                secure=parsed_url.scheme == 'https', expires=None, discard=True,
+                comment=None, comment_url=None, rest={'HttpOnly': None}, rfc2109=False))
+            self._request(self.base_url + REFRESH_PATH)
+            target_domain = 'koreanair.com' if is_korean_air else host.lower()
+            rotated = token
+            for cookie in self.cookies:
+                cookie_domain = cookie.domain.lstrip('.').lower()
+                if (cookie.name == 'T'
+                        and (cookie_domain.endswith('koreanair.com')
+                             if is_korean_air else cookie_domain == target_domain)):
+                    rotated = cookie.value
+            raw = self._request(self.base_url + USER_INFO_PATH)
+            payload = json.loads(raw)
+            info = payload.get('userInfo', payload) if isinstance(payload, dict) else None
+            required = ('skypassNumber', 'englishLastName', 'englishFirstName')
+            if not isinstance(info, dict) or not all(
+                    isinstance(info.get(key), str) and info[key].strip() for key in required):
+                raise ValueError('로그인 회원 정보를 확인할 수 없습니다.')
+            self.traveler = {
+                'travellerType': 'ADT', 'fqtvNumber': info['skypassNumber'],
+                'lastName': info['englishLastName'], 'firstName': info['englishFirstName'],
+            }
+            return rotated
+        except Exception as exc:
+            self.traveler = None
+            status = re.match(r'^HTTP (\d{3}):', str(exc))
+            reason = f' (HTTP {status[1]})' if status else ''
+            raise RuntimeError(
+                '세션 만료 또는 로그인 상태가 아닙니다: 브라우저에서 다시 로그인한 뒤 '
+                f'세션 쿠키 T를 다시 등록하세요.{reason}') from None
 
     def fetch_live(self, origin, destination, day):
         if self.traveler is None:

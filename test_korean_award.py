@@ -9,8 +9,9 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 from korean_award import (
-    AwardClient, LOGIN_PATH, LIVE_PATH, extract, find_candidates, live_result,
-    login_settings, month_start, next_month, query_window,
+    AwardClient, LIVE_PATH, LOGIN_PATH, REFRESH_PATH, USER_INFO_PATH, extract,
+    find_candidates, live_result, login_settings, month_start, next_month,
+    query_window,
 )
 
 
@@ -157,6 +158,39 @@ class HTTPTests(unittest.TestCase):
                 pass
 
             def do_GET(self):
+                if self.path == REFRESH_PATH:
+                    self.server.refresh_calls += 1
+                    if self.server.session_mode == 'refresh-http403':
+                        self.send_response(403)
+                        self.end_headers()
+                        self.wfile.write(b'private response')
+                        return
+                    self.send_response(200)
+                    self.send_header(
+                        'Set-Cookie',
+                        f'T={self.server.rotated_token}; Domain={self.server.cookie_domain}; '
+                        'Path=/; HttpOnly')
+                    self.end_headers()
+                    return
+                if self.path == USER_INFO_PATH:
+                    self.server.userinfo_calls += 1
+                    authenticated = f'T={self.server.rotated_token}' in self.headers.get('Cookie', '')
+                    self.send_response(200)
+                    self.end_headers()
+                    if self.server.session_mode == 'bad-user-json':
+                        self.wfile.write(b'not json')
+                    elif not authenticated or self.server.session_mode == 'empty-user-info':
+                        self.wfile.write(json.dumps({
+                            'skypassNumber': '', 'englishLastName': '',
+                            'englishFirstName': '',
+                        }).encode())
+                    else:
+                        self.wfile.write(json.dumps({
+                            'skypassNumber': 'SESSION-ACCOUNT',
+                            'englishFirstName': 'SESSION',
+                            'englishLastName': 'USER',
+                        }).encode())
+                    return
                 self.send_response(200)
                 self.send_header('Set-Cookie', 'award-test=1; Path=/; HttpOnly')
                 self.end_headers()
@@ -187,12 +221,16 @@ class HTTPTests(unittest.TestCase):
                             'englishLastName': 'USER'}}).encode())
                     return
                 if self.path == LIVE_PATH:
-                    if 'auth-test=1' not in self.headers.get('Cookie', ''):
+                    cookies = self.headers.get('Cookie', '')
+                    if ('auth-test=1' not in cookies
+                            and f'T={self.server.rotated_token}' not in cookies):
                         self.send_response(401)
                         self.end_headers()
                         return
                     self.server.live_calls += 1
                     self.server.live_session_id = self.headers.get('ksessionId')
+                    self.server.live_body = body
+                    self.server.live_cookie = cookies
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(json.dumps(live_fixture()).encode())
@@ -216,8 +254,13 @@ class HTTPTests(unittest.TestCase):
 
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.server.mode = 'ok'
+        self.server.session_mode = 'ok'
+        self.server.cookie_domain = '127.0.0.1'
+        self.server.rotated_token = 'rotated-session-token'
         self.server.login_calls = 0
         self.server.live_calls = 0
+        self.server.refresh_calls = 0
+        self.server.userinfo_calls = 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.client = AwardClient(f'http://127.0.0.1:{self.server.server_port}')
@@ -307,6 +350,45 @@ class HTTPTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '로그인'):
             self.client.fetch_live('ICN', 'JFK', date(2027, 10, 22))
         self.assertEqual(self.server.live_calls, 0)
+
+    def test_session_login_refreshes_cookie_and_searches_as_traveler(self):
+        self.client.initialize()
+        rotated = self.client.login_from_session('initial-session-token')
+        self.assertEqual(rotated, self.server.rotated_token)
+        self.assertEqual(self.server.refresh_calls, 1)
+        self.assertEqual(self.server.userinfo_calls, 1)
+        self.assertEqual(self.client.traveler, {
+            'travellerType': 'ADT', 'fqtvNumber': 'SESSION-ACCOUNT',
+            'lastName': 'USER', 'firstName': 'SESSION',
+        })
+        payload = self.client.fetch_live('ICN', 'JFK', date(2027, 10, 22))
+        self.assertEqual(live_result(payload, 'ICN', 'JFK', LIVE_ROW)[0], '예매 검색에서 선택 가능')
+        self.assertIn(f'T={self.server.rotated_token}', self.server.live_cookie)
+        self.assertEqual(self.server.live_body['travelers'], [self.client.traveler])
+
+    def test_empty_session_user_info_is_sanitized(self):
+        self.client.initialize()
+        self.server.session_mode = 'empty-user-info'
+        with self.assertRaisesRegex(RuntimeError, '세션 만료 또는 로그인 상태가 아닙니다') as caught:
+            self.client.login_from_session('private-session-token')
+        self.assertNotIn('private-session-token', str(caught.exception))
+        self.assertIsNone(self.client.traveler)
+
+    def test_non_json_session_user_info_is_sanitized(self):
+        self.client.initialize()
+        self.server.session_mode = 'bad-user-json'
+        with self.assertRaisesRegex(RuntimeError, '세션 만료 또는 로그인 상태가 아닙니다'):
+            self.client.login_from_session('private-session-token')
+        self.assertIsNone(self.client.traveler)
+
+    def test_session_refresh_http_status_is_retained_without_response(self):
+        self.client.initialize()
+        self.server.session_mode = 'refresh-http403'
+        with self.assertRaisesRegex(RuntimeError, r'세션 만료.*HTTP 403') as caught:
+            self.client.login_from_session('private-session-token')
+        self.assertNotIn('private-session-token', str(caught.exception))
+        self.assertNotIn('private response', str(caught.exception))
+        self.assertIsNone(self.client.traveler)
 
 
 if __name__ == '__main__':

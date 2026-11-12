@@ -2,25 +2,47 @@
 
 Python 3.10 이상에서 표준 라이브러리만으로 실행합니다. 브라우저, Playwright,
 추가 pip 패키지는 필요하지 않습니다. 공개 현황 조회는 비로그인으로 가능하며,
-실제 예매 검색 재확인에는 환경 변수로 전달한 로그인 정보가 필요합니다.
+실제 예매 검색 재확인에는 로그인 정보가 필요합니다. 여러 노선과 날짜 범위를 지정하고
+에이전트용 단일 JSON 결과를 출력할 수 있습니다.
 
-시작 월부터 한국 시간 오늘 + 360일까지 월별로 조회하여 프레스티지석 보너스(O),
-일등석 보너스(A)를 출력합니다. 승급(Z 등)은 제외합니다.
+기본 좌석 종류는 프레스티지석 보너스(O), 일등석 보너스(A)입니다.
+`upgrade`를 선택하면 마일리지 승급 좌석(Z) 공개 현황도 포함합니다.
 문서화된 공식 외부 공개 API가 아니라 공식 웹사이트의 조회 API를 이용합니다.
 
 ```bash
-# 이번 달부터 조회 한도까지
+# 여러 노선, 기본 날짜 범위
+python korean_award.py --routes ICN-JFK,ICN-FRA
+
+# 날짜 범위와 에이전트용 JSON
+python korean_award.py --routes ICN-JFK,ICN-FRA \
+  --start 2027-01-01 --end 2027-03-31 --json
+
+# 보너스와 마일리지 승급 좌석 모두 조회
+python korean_award.py --routes ICN-JFK --seat-types award,upgrade
+
+# 공개 후보를 예매 검색으로 재확인
+python korean_award.py --routes ICN-JFK --verify-live
+
+# 기존 단일 노선 형식도 지원
 python korean_award.py --origin ICN --destination JFK
-
-# 시작 월 변경: 해당 월부터 조회 한도까지
-python korean_award.py --origin ICN --destination JFK --month 2027-01
-
-# 시작 월과 종료 월 지정
-python korean_award.py --origin ICN --destination JFK --month 2027-01 --until 2027-03
-
-# 반대 방향
-python korean_award.py --origin JFK --destination ICN
 ```
+
+`--routes`는 공백을 제거하고 대문자로 정규화하며 중복 노선은 처음 한 번만 조회합니다.
+`--start`와 `--end`는 포함 날짜이며 기본 조회 한도는 한국 시간 오늘부터 360일입니다.
+종료일이 한도를 넘으면 한도까지 잘라 조회합니다. 기존 `--month`/`--until`도 사용할 수
+있지만 `--start`/`--end`와 함께 지정할 수 없습니다.
+
+`--seat-types`는 `award`, `upgrade`를 쉼표로 지정하며 기본값은 `award`입니다.
+`--verify-live`는 보너스 좌석 후보만 예매 검색으로 확인합니다. 승급 좌석은
+`unsupported`(공개 현황 기준)로 표시하고 실시간 검색하지 않습니다.
+
+`--json`은 진행 문구 없이 stdout에 JSON 객체 하나를 출력합니다. 주요 필드는
+`checked_at`, `window`, `seat_types`, `verify_live`, `routes`, `summary`이며,
+각 노선에는 `route`, `status`, `error`, `months_completed`, `results`가 있습니다.
+결과 행은 `date`, `flight`, `departure_time`, `seat_type`, `cabin`, `live_status`,
+`live_detail`, `seats`를 포함합니다. `live_status`는 `selectable`, `not_selectable`,
+`unknown`, `unsupported`, `not_checked` 중 하나이며 요약에는 공개 후보 수, 상태별 건수,
+노선 오류 수가 포함됩니다. 종료 코드는 정상 0, 노선 오류 또는 미확인 결과 1입니다.
 
 ## 동작 방식
 
@@ -90,7 +112,7 @@ read -r -s -p '비밀번호: ' KOREANAIR_PASSWORD
 printf '\n'
 export KOREANAIR_USERNAME KOREANAIR_PASSWORD
 
-python korean_award.py --origin ICN --destination JFK --verify-live
+python korean_award.py --routes ICN-JFK --verify-live
 
 unset KOREANAIR_USERNAME KOREANAIR_PASSWORD
 ```
@@ -99,6 +121,14 @@ unset KOREANAIR_USERNAME KOREANAIR_PASSWORD
 - `KOREANAIR_PASSWORD`: 해당 계정의 비밀번호. 앞뒤 공백 등 원문을 변경하지 않습니다.
 - `KOREANAIR_LOGIN_TYPE`: 기본 `id`. 스카이패스 번호로 로그인하려면 `skypass`로 설정하고
   `KOREANAIR_USERNAME`에 스카이패스 번호를 넣으세요. 소셜 로그인은 지원하지 않습니다.
+- 세션 쿠키 JSON 파일은 `--session FILE` 또는 `KOREANAIR_SESSION_FILE`로 지정할 수
+  있으며, 기본 경로는 `~/.local/state/korean_air_alert/session.json`입니다.
+  파일이 없으면 `KOREANAIR_SESSION_T`를 초기 토큰으로 사용할 수 있습니다.
+  성공한 세션 갱신은 파일에 원자적으로 저장하며 권한은 0600입니다. T는 로그인 세션과
+  동등한 비밀정보이므로 공유하거나 로그에 남기지 마세요.
+- `--cdp URL` 또는 `KOREANAIR_CDP_URL`을 지정하면 저장된 세션이 만료됐을 때 로그인된
+  Chrome의 원격 디버깅 포트에서 T를 다시 가져옵니다. T는 출력하지 않습니다.
+- Grok Bot용 스킬은 `.grok/skills/korean-air-award-search/SKILL.md`에 있습니다.
 - `--verify-live` 없이 실행하면 환경 변수와 무관하게 로그인하지 않습니다.
 - 로그인 실패 시 재시도하지 않습니다. CAPTCHA/추가 인증이 필요하면 미확인 상태로 종료합니다.
 - 로그인 정보와 회원 정보, 쿠키, 응답 원문을 파일이나 로그에 저장하지 않습니다.

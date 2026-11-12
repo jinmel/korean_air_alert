@@ -6,6 +6,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 import http.cookiejar
+from pathlib import Path
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,7 @@ LIVE_PATH = '/api/ap/booking/avail/awardAvailability'
 FARE_FAMILIES = {'프레스티지석 보너스': 'KEBONUSPR', '일등석 보너스': 'KEBONUSFC'}
 KST = timezone(timedelta(hours=9))
 CABINS = {'O': '프레스티지석 보너스', 'A': '일등석 보너스'}
+UPGRADE_CABINS = {'Z': '마일리지 승급 좌석'}
 
 
 def month_start(text):
@@ -45,7 +47,8 @@ def parse_date(value):
     return None
 
 
-def extract(payload, start, end):
+def extract(payload, start, end, cabins=None):
+    cabins = CABINS if cabins is None else cabins
     rows, dates = set(), set()
     recognized = 0
 
@@ -70,9 +73,9 @@ def extract(payload, start, end):
                     raise ValueError('좌석 날짜 또는 availableSeat 형식이 예상과 다릅니다.')
                 dates.add(day)
                 code = str(node['bookingClass']).strip().upper()
-                if start <= day <= end and code in CABINS and available:
+                if start <= day <= end and code in cabins and available:
                     rows.add((day.isoformat(), flight,
-                              str(node.get('departureTime', '')), CABINS[code]))
+                              str(node.get('departureTime', '')), cabins[code]))
             for value in node.values():
                 if isinstance(value, (dict, list)):
                     walk(value, day, flight)
@@ -195,7 +198,56 @@ def query_window(today, month=None, until=None, days=360):
     return first, max(today, first), limit
 
 
-def find_candidates(client, origin, destination, first, start, limit, out=None):
+def date_window(today, start=None, end=None, days=360):
+    if days < 1:
+        raise ValueError('일수는 1 이상이어야 합니다.')
+    limit = today + timedelta(days=days)
+
+    def parse_day(value, label):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            raise ValueError(f'{label}은 YYYY-MM-DD 형식이어야 합니다.')
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise ValueError(f'{label}은 유효한 날짜여야 합니다.') from None
+
+    start_day = parse_day(start, '시작일') or today
+    end_day = parse_day(end, '종료일') or limit
+    if start_day < today:
+        raise ValueError('시작일이 오늘(한국 시간) 이전입니다.')
+    if start_day > limit:
+        raise ValueError('시작일이 조회 한도를 초과합니다.')
+    if end_day < start_day:
+        raise ValueError('종료일이 시작일보다 이전입니다.')
+    end_day = min(end_day, limit)
+    return start_day.replace(day=1), start_day, end_day
+
+
+def parse_routes(value):
+    routes = []
+    seen = set()
+    for item in value.split(','):
+        route = item.strip().upper()
+        if not re.fullmatch(r'[A-Z]{3}-[A-Z]{3}', route):
+            raise ValueError('--routes는 공항 코드 형식 ORIG-DEST의 쉼표 목록이어야 합니다.')
+        origin, destination = route.split('-')
+        if origin == destination:
+            raise ValueError('노선의 출발 공항과 도착 공항은 달라야 합니다.')
+        if route not in seen:
+            routes.append((origin, destination))
+            seen.add(route)
+    if not routes:
+        raise ValueError('--routes를 하나 이상 지정해야 합니다.')
+    return routes
+
+
+def find_candidates(client, origin, destination, first, start, limit, out=None, cabins=None):
     current = first
     candidates = []
     completed = 0
@@ -204,7 +256,7 @@ def find_candidates(client, origin, destination, first, start, limit, out=None):
             payload = client.fetch_month(origin, destination, current)
             end = min(limit, current.replace(
                 day=calendar.monthrange(current.year, current.month)[1]))
-            rows = extract(payload, max(start, current), end)
+            rows = extract(payload, max(start, current), end, cabins)
         except Exception as exc:
             raise RuntimeError(f'{current:%Y-%m} 조회 미완료: {exc}') from exc
         if callable(out):
@@ -212,7 +264,7 @@ def find_candidates(client, origin, destination, first, start, limit, out=None):
             for row in rows:
                 out('\t'.join(row))
             if not rows:
-                out('대상 기간의 O/A 보너스 좌석 표시 없음')
+                out('대상 기간의 선택한 좌석 종류 후보 표시 없음')
         candidates.extend(rows)
         completed += 1
         current = next_month(current)
@@ -402,58 +454,271 @@ class AwardClient:
         return payload
 
 
-def main():
+def _cli_error_message(exc, environ, tokens):
+    message = str(exc).splitlines()[0].strip() if str(exc).splitlines() else ''
+    secrets = [environ.get(name) for name in (
+        'KOREANAIR_USERNAME', 'KOREANAIR_PASSWORD', 'KOREANAIR_SESSION_T')]
+    secrets.extend(tokens)
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, '[숨김]')
+    return message or type(exc).__name__
+
+
+def _result_row(row, verify_live):
+    cabin = row[3]
+    seat_type = 'upgrade' if cabin in UPGRADE_CABINS.values() else 'award'
+    if not verify_live:
+        live_status, live_detail = 'not_checked', None
+    elif seat_type == 'upgrade':
+        live_status, live_detail = 'unsupported', '실시간 확인 미지원: 공개 현황 기준'
+    else:
+        live_status, live_detail = 'unknown', None
+    return {
+        'date': row[0], 'flight': row[1], 'departure_time': row[2],
+        'seat_type': seat_type, 'cabin': cabin,
+        'live_status': live_status, 'live_detail': live_detail, 'seats': None,
+    }
+
+
+def _summary(routes):
+    results = [row for route in routes for row in route['results']]
+    return {
+        'public_candidates': len(results),
+        'selectable': sum(row['live_status'] == 'selectable' for row in results),
+        'not_selectable': sum(row['live_status'] == 'not_selectable' for row in results),
+        'unknown': sum(row['live_status'] == 'unknown' for row in results),
+        'unsupported': sum(row['live_status'] == 'unsupported' for row in results),
+        'route_errors': sum(route['status'] == 'error' for route in routes),
+    }
+
+
+def _print_json(value):
+    print(json.dumps(value, ensure_ascii=False))
+
+
+def main(argv=None, environ=None, client_factory=AwardClient, now=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--origin', required=True, type=str.upper, help='출발 공항 코드, 예: ICN')
-    parser.add_argument('--destination', required=True, type=str.upper, help='도착 공항 코드, 예: JFK')
+    parser.add_argument('--routes', help='노선 쉼표 목록, 예: ICN-JFK,ICN-FRA')
+    parser.add_argument('--origin', help='출발 공항 코드, 예: ICN (기존 단일 노선 옵션)')
+    parser.add_argument('--destination', help='도착 공항 코드, 예: JFK (기존 단일 노선 옵션)')
+    parser.add_argument('--start', help='조회 시작일 YYYY-MM-DD')
+    parser.add_argument('--end', help='조회 종료일 YYYY-MM-DD (포함)')
     parser.add_argument('--month', help='시작 월 YYYY-MM (기본: 한국 시간 이번 달)')
-    parser.add_argument('--until', help='종료 월 YYYY-MM (기본: 조회 한도까지)')
+    parser.add_argument('--until', help='종료 월 YYYY-MM (기존 옵션)')
     parser.add_argument('--days', type=int, default=360, help='오늘부터 최대 일수 (기본: 360)')
-    parser.add_argument('--verify-live', action='store_true', help='환경 변수로 로그인 후 후보 날짜를 실제 예매 검색으로 재확인(본인 성인 1명)')
-    args = parser.parse_args()
-    if not all(re.fullmatch(r'[A-Z]{3}', x) for x in (args.origin, args.destination)):
-        parser.error('공항 코드는 영문 세 자리여야 합니다.')
-    if args.origin == args.destination:
-        parser.error('출발 공항과 도착 공항이 같습니다.')
-    if args.verify_live:
+    parser.add_argument('--seat-types', default='award',
+                        help='좌석 종류 쉼표 목록: award,upgrade (기본: award)')
+    parser.add_argument('--verify-live', action='store_true',
+                        help='후보를 실제 예매 검색으로 재확인(본인 성인 1명)')
+    parser.add_argument('--session', help='세션 쿠키 JSON 파일 경로')
+    parser.add_argument('--json', action='store_true', help='결과를 JSON 한 개로 출력')
+    args = parser.parse_args(argv)
+    environ = os.environ if environ is None else environ
+
+    if args.routes and (args.origin or args.destination):
+        parser.error('--routes와 --origin/--destination은 함께 사용할 수 없습니다.')
+    if args.routes:
         try:
-            login_settings()
+            routes = parse_routes(args.routes)
         except ValueError as exc:
             parser.error(str(exc))
-    today = datetime.now(KST).date()
+    elif args.origin or args.destination:
+        if not args.origin or not args.destination:
+            parser.error('--origin과 --destination을 함께 지정해야 합니다.')
+        legacy_route = f'{args.origin.strip().upper()}-{args.destination.strip().upper()}'
+        try:
+            routes = parse_routes(legacy_route)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        parser.error('--routes 또는 --origin과 --destination을 지정해야 합니다.')
+    if bool(args.month or args.until) and bool(args.start or args.end):
+        parser.error('--month/--until과 --start/--end는 함께 사용할 수 없습니다.')
+
+    seat_types = []
+    for value in args.seat_types.split(','):
+        seat_type = value.strip().lower()
+        if seat_type not in ('award', 'upgrade'):
+            parser.error('--seat-types는 award,upgrade 중 하나 이상의 쉼표 목록이어야 합니다.')
+        if seat_type not in seat_types:
+            seat_types.append(seat_type)
+    if not seat_types:
+        parser.error('--seat-types를 하나 이상 지정해야 합니다.')
+
+    if now is None:
+        checked_at = datetime.now(KST)
+    elif isinstance(now, datetime):
+        checked_at = now.replace(tzinfo=KST) if now.tzinfo is None else now.astimezone(KST)
+    elif isinstance(now, date):
+        checked_at = datetime.combine(now, datetime.min.time(), KST)
+    else:
+        raise TypeError('현재 시각 형식이 올바르지 않습니다.')
+    today = checked_at.date()
     try:
-        first, start, limit = query_window(
-            today, args.month, args.until, args.days)
+        if args.month or args.until:
+            first, start, limit = query_window(today, args.month, args.until, args.days)
+        else:
+            first, start, limit = date_window(today, args.start, args.end, args.days)
     except (ValueError, OverflowError) as exc:
         parser.error(str(exc))
 
-    print(f'{args.origin} → {args.destination}: {start} ~ {limit} (한국 시간)', flush=True)
-    client = AwardClient()
-    client.initialize()
-    candidates, completed = find_candidates(
-        client, args.origin, args.destination, first, start, limit,
-        out=lambda line: print(line, flush=True))
-    total = len(candidates)
-    print(f'완료: {completed}개월, {total}건 (좌석 수가 아닌 항공편·등급별 표시 건수)')
-    if not args.verify_live:
-        print('공개 현황이며 최종 예약 가능 여부는 예매 화면에서 확인하세요.')
-        return
-    if not candidates:
-        print('공개 현황의 후보가 없어 실시간 검색을 수행하지 않았습니다. 전체 날짜에 대한 실시간 검색 결과가 아닙니다.')
-        return
-    print('\n실제 예매 검색 재확인: 로그인한 본인 성인 1명', flush=True)
-    client.login_from_env()
-    results = verify_candidates(
-        client, args.origin, args.destination, candidates,
-        out=lambda line: print(line, flush=True))
-    print('결과는 예매 검색 시점의 상태입니다. 좌석 확보·예약 생성·결제는 하지 않습니다.')
-    if any(status.startswith('미확인') for _, status, _ in results):
-        raise RuntimeError('일부 후보의 실시간 상태를 확인하지 못했습니다. 미확인을 좌석 없음으로 판단하지 마세요.')
+    window = {'start': start.isoformat(), 'end': limit.isoformat()}
+    stamp = checked_at.isoformat(timespec='seconds')
+    cabins = {}
+    if 'award' in seat_types:
+        cabins.update(CABINS)
+    if 'upgrade' in seat_types:
+        cabins.update(UPGRADE_CABINS)
+    client = client_factory()
+    seen_tokens = []
+    route_results = []
+    session_logged_in = False
+    session_login_attempted = False
+    stop_live = False
+    stop_message = '이전 실시간 검색 실패로 중단'
+
+    def emit_progress(line):
+        if not args.json:
+            print(line, flush=True)
+
+    def add_public_results(route_result, rows):
+        route_result['results'] = [_result_row(row, args.verify_live) for row in rows]
+
+    try:
+        client.initialize()
+        for route_index, (origin, destination) in enumerate(routes):
+            route_name = f'{origin}-{destination}'
+            route_result = {
+                'route': route_name, 'status': 'ok', 'error': None,
+                'months_completed': 0, 'results': [],
+            }
+            route_results.append(route_result)
+            if not args.json:
+                print(f'{origin} → {destination}: {start} ~ {limit} (한국 시간)')
+            completed_months = [0]
+
+            def progress(line):
+                if line.startswith('\n['):
+                    completed_months[0] += 1
+                emit_progress(line)
+
+            try:
+                rows, completed = find_candidates(
+                    client, origin, destination, first, start, limit,
+                    out=progress, cabins=cabins)
+                route_result['months_completed'] = completed
+            except Exception as exc:
+                route_result['months_completed'] = completed_months[0]
+                route_result['status'] = 'error'
+                route_result['error'] = _cli_error_message(exc, environ, seen_tokens)
+                if not args.json:
+                    print(f'조회 실패: {route_result["error"]}')
+                if route_index + 1 < len(routes):
+                    time.sleep(2)
+                continue
+
+            if not args.json:
+                print(f'완료: {completed}개월, {len(rows)}건 '
+                      '(좌석 수가 아닌 항공편·등급별 표시 건수)')
+            add_public_results(route_result, rows)
+            award_rows = [row for row in rows if row[3] in CABINS.values()]
+            row_results = {
+                row: result for row, result in zip(rows, route_result['results'])
+            }
+            if args.verify_live and stop_live:
+                route_result['status'] = 'error'
+                route_result['error'] = stop_message
+                continue
+            if args.verify_live and award_rows:
+                try:
+                    if not session_login_attempted:
+                        session_login_attempted = True
+                        from hermes_alert import (
+                            DEFAULT_SESSION, _read_session, _write_json_atomic,
+                        )
+                        selected_session = (
+                            args.session or environ.get('KOREANAIR_SESSION_FILE')
+                            or DEFAULT_SESSION)
+                        session_path = Path(selected_session).expanduser()
+                        token = _read_session(session_path, environ)
+                        if token:
+                            seen_tokens.append(token)
+                            rotated = client.login_from_session(token)
+                            if not isinstance(rotated, str) or not rotated:
+                                raise RuntimeError('세션 쿠키 갱신 결과를 확인하지 못했습니다.')
+                            if rotated:
+                                seen_tokens.append(rotated)
+                            _write_json_atomic(session_path, {
+                                'T': rotated, 'updated': stamp,
+                            })
+                            session_logged_in = True
+                        else:
+                            login_settings(environ)
+                            client.login_from_env(environ)
+                            session_logged_in = True
+                    elif not session_logged_in:
+                        raise RuntimeError(stop_message)
+                    results = verify_candidates(
+                        client, origin, destination, award_rows)
+                    for row, status, seats in results:
+                        result = row_results[row]
+                        result['live_detail'] = status
+                        result['seats'] = seats
+                        if status == '예매 검색에서 선택 가능':
+                            result['live_status'] = 'selectable'
+                        elif status == '예매 검색에서 선택 불가':
+                            result['live_status'] = 'not_selectable'
+                        else:
+                            result['live_status'] = 'unknown'
+                    if not args.json:
+                        for row, status, seats in results:
+                            count = f' / 응답 좌석 수 {seats}' if seats is not None else ''
+                            print(f'\t{row[0]}\t{row[1]}\t{row[2]}\t{row[3]}\t'
+                                  f'{status}{count}')
+                except Exception as exc:
+                    route_result['status'] = 'error'
+                    route_result['error'] = _cli_error_message(exc, environ, seen_tokens)
+                    stop_live = True
+                    stop_message = '이전 실시간 검색 실패로 중단'
+                    for row in award_rows:
+                        row_results[row]['live_status'] = 'unknown'
+                        row_results[row]['live_detail'] = None
+                    if not args.json:
+                        print(f'실시간 조회 실패: {route_result["error"]}')
+            if route_index + 1 < len(routes):
+                time.sleep(2)
+
+        summary = _summary(route_results)
+        payload = {
+            'checked_at': stamp, 'window': window, 'seat_types': seat_types,
+            'verify_live': args.verify_live, 'routes': route_results,
+            'summary': summary,
+        }
+        if args.json:
+            _print_json(payload)
+        else:
+            if not args.verify_live:
+                print('공개 현황이며 최종 예약 가능 여부는 예매 화면에서 확인하세요.')
+            print('요약: ' + ', '.join(
+                f'{key}={value}' for key, value in summary.items()))
+        return 1 if summary['route_errors'] or summary['unknown'] else 0
+    except Exception as exc:
+        message = _cli_error_message(exc, environ, seen_tokens)
+        if args.json:
+            _print_json({
+                'error': message, 'checked_at': stamp, 'window': window,
+                'seat_types': seat_types, 'verify_live': args.verify_live,
+                'routes': route_results, 'summary': _summary(route_results),
+            })
+        else:
+            print(f'조회 실패: {message}\n미조회 기간은 좌석 없음으로 판단하지 마세요.')
+        return 1
 
 
 if __name__ == '__main__':
     try:
-        main()
+        raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
     except Exception as exc:

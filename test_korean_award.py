@@ -1,17 +1,20 @@
 import unittest
 import json
+import stat
+import tempfile
 import threading
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from korean_award import (
-    AwardClient, LIVE_PATH, LOGIN_PATH, REFRESH_PATH, USER_INFO_PATH, extract,
-    find_candidates, live_result, login_settings, month_start, next_month,
-    query_window,
+    AwardClient, KST, LIVE_PATH, LOGIN_PATH, REFRESH_PATH, USER_INFO_PATH,
+    UPGRADE_CABINS, date_window, extract, find_candidates, live_result,
+    login_settings, main, month_start, next_month, parse_routes, query_window,
 )
 
 
@@ -40,6 +43,210 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(completed, 1)
         self.assertEqual(output.getvalue(), '')
+
+    def test_date_window_defaults_rejects_and_clips(self):
+        today = date(2027, 10, 22)
+        self.assertEqual(date_window(today), (
+            date(2027, 10, 1), today, today + timedelta(days=360)))
+        self.assertEqual(date_window(today, '2027-11-02', '2028-12-31', 30), (
+            date(2027, 11, 1), date(2027, 11, 2), today + timedelta(days=30)))
+        with self.assertRaisesRegex(ValueError, '시작일이 오늘'):
+            date_window(today, '2027-10-21')
+        with self.assertRaisesRegex(ValueError, '종료일이 시작일'):
+            date_window(today, '2027-10-23', '2027-10-22')
+        with self.assertRaisesRegex(ValueError, '시작일이 조회 한도'):
+            date_window(today, '2028-10-18', days=360)
+
+    def test_parse_routes_normalizes_deduplicates_and_rejects_invalid_routes(self):
+        self.assertEqual(parse_routes(' icn-jfk, ICN-FRA,icn-jfk '),
+                         [('ICN', 'JFK'), ('ICN', 'FRA')])
+        for value in ('ICN-JFK, bad', 'ICN-ICN', ','):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_routes(value)
+
+
+class CliClient:
+    def __init__(self, fail_public_route=None, live_unknown=False, live_error=False):
+        self.fail_public_route = fail_public_route
+        self.live_unknown = live_unknown
+        self.live_error = live_error
+        self.session_calls = []
+        self.env_login_calls = 0
+
+    def initialize(self):
+        pass
+
+    def fetch_month(self, origin, destination, month):
+        if f'{origin}-{destination}' == self.fail_public_route:
+            raise RuntimeError('공개 조회 실패')
+        return {'flightList': [{
+            'departureDate': '20271022',
+            'flightNumber': 'KE081',
+            'flightDetailList': [
+                {'bookingClass': code, 'availableSeat': True,
+                 'departureTime': '10:00'}
+                for code in ('O', 'A', 'Z')
+            ],
+        }]}
+
+    def login_from_session(self, token):
+        self.session_calls.append(token)
+        return 'rotated-cli-session-token'
+
+    def login_from_env(self, environ=None):
+        self.env_login_calls += 1
+
+    def fetch_live(self, origin, destination, day):
+        if self.live_error:
+            raise RuntimeError('실시간 검색 실패')
+        if self.live_unknown:
+            return {'errors': ['unknown']}
+        fares = [
+            {'fareFamily': 'KEBONUSPR', 'bookingClass': 'O',
+             'seatCount': '2', 'recommendId': 'offer-o', 'soldout': False},
+            {'fareFamily': 'KEBONUSFC', 'bookingClass': 'A',
+             'seatCount': '1', 'recommendId': 'offer-a', 'soldout': False},
+        ]
+        return {'upsellBoundAvailList': [{'availFlightList': [{
+            'flightInfoList': [{
+                'carrierCode': 'KE', 'flightNumber': '81',
+                'departureAirport': origin, 'arrivalAirport': destination,
+                'departureDateTime': day.strftime('%Y%m%d') + '1000',
+            }],
+            'commercialFareFamilyList': fares,
+        }]}]}
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2027, 10, 22, 9, 0, tzinfo=KST)
+
+    def run_cli(self, argv, client=None, environ=None):
+        output = io.StringIO()
+        client = client or CliClient()
+        with (patch('korean_award.time.sleep'), redirect_stdout(output)):
+            result = main(
+                argv, environ=({
+                    'KOREANAIR_USERNAME': 'cli-test-user',
+                    'KOREANAIR_PASSWORD': 'cli-test-password',
+                } if environ is None else environ), client_factory=lambda: client,
+                now=self.now)
+        return result, output.getvalue(), client
+
+    def json_args(self, *extra):
+        return [
+            '--routes', 'ICN-JFK', '--start', '2027-10-22',
+            '--end', '2027-10-22', '--json', *extra,
+        ]
+
+    def test_routes_options_validate_and_legacy_route_works(self):
+        for argv in (
+                ['--routes', 'ICN-JFK', '--origin', 'ICN', '--destination', 'JFK'],
+                ['--origin', 'ICN'],
+                ['--routes', 'ICN-ICN']):
+            stderr = io.StringIO()
+            with self.subTest(argv=argv), redirect_stderr(stderr), self.assertRaises(SystemExit):
+                main(argv, environ={}, now=self.now)
+        result, output, _ = self.run_cli([
+            '--origin', 'icn', '--destination', 'jfk',
+            '--start', '2027-10-22', '--end', '2027-10-22', '--json',
+        ])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output)['routes'][0]['route'], 'ICN-JFK')
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            main(['--routes', 'ICN-JFK', '--start', '2027-10-22',
+                  '--month', '2027-10'], environ={}, now=self.now)
+
+    def test_seat_types_default_upgrade_only_and_both(self):
+        result, output, _ = self.run_cli(self.json_args())
+        self.assertEqual(result, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload['seat_types'], ['award'])
+        self.assertEqual({row['seat_type'] for row in payload['routes'][0]['results']},
+                         {'award'})
+        result, output, _ = self.run_cli(self.json_args('--seat-types', 'upgrade'))
+        self.assertEqual(result, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload['routes'][0]['results'][0]['cabin'], '마일리지 승급 좌석')
+        result, output, _ = self.run_cli(self.json_args('--seat-types', 'award,upgrade'))
+        self.assertEqual(result, 0)
+        self.assertEqual(len(json.loads(output)['routes'][0]['results']), 3)
+
+    def test_json_public_only_marks_candidates_not_checked(self):
+        result, output, _ = self.run_cli(self.json_args())
+        payload = json.loads(output)
+        self.assertEqual(result, 0)
+        self.assertEqual(payload['routes'][0]['status'], 'ok')
+        self.assertTrue(all(row['live_status'] == 'not_checked'
+                            for row in payload['routes'][0]['results']))
+
+    def test_json_live_verification_marks_awards_and_upgrade(self):
+        result, output, _ = self.run_cli(
+            self.json_args('--verify-live', '--seat-types', 'award,upgrade'))
+        payload = json.loads(output)
+        self.assertEqual(result, 0)
+        statuses = {row['seat_type']: row['live_status']
+                    for row in payload['routes'][0]['results']}
+        self.assertEqual(statuses, {'award': 'selectable', 'upgrade': 'unsupported'})
+        self.assertEqual(payload['summary']['selectable'], 2)
+        self.assertEqual(payload['summary']['unsupported'], 1)
+
+    def test_json_unknown_returns_error_code(self):
+        result, output, _ = self.run_cli(
+            self.json_args('--verify-live'), CliClient(live_unknown=True))
+        payload = json.loads(output)
+        self.assertEqual(result, 1)
+        self.assertTrue(all(row['live_status'] == 'unknown'
+                            for row in payload['routes'][0]['results']))
+
+    def test_public_failure_does_not_prevent_other_route(self):
+        result, output, _ = self.run_cli(
+            ['--routes', 'ICN-JFK,ICN-FRA', '--start', '2027-10-22',
+             '--end', '2027-10-22', '--json'],
+            CliClient(fail_public_route='ICN-JFK'))
+        payload = json.loads(output)
+        self.assertEqual(result, 1)
+        self.assertEqual([route['status'] for route in payload['routes']],
+                         ['error', 'ok'])
+        self.assertEqual(payload['routes'][1]['months_completed'], 1)
+
+    def test_live_failure_marks_remaining_routes_and_keeps_rows_unknown(self):
+        result, output, _ = self.run_cli(
+            ['--routes', 'ICN-JFK,ICN-FRA', '--start', '2027-10-22',
+             '--end', '2027-10-22', '--verify-live', '--json'],
+            CliClient(live_error=True))
+        payload = json.loads(output)
+        self.assertEqual(result, 1)
+        self.assertEqual([route['status'] for route in payload['routes']],
+                         ['error', 'error'])
+        self.assertEqual(payload['routes'][1]['error'], '이전 실시간 검색 실패로 중단')
+        self.assertTrue(all(row['live_status'] == 'unknown'
+                            for row in payload['routes'][1]['results']))
+
+    def test_session_token_is_rotated_and_saved_without_stdout_leak(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = Path(directory) / 'session.json'
+            session_path.write_text(json.dumps({'T': 'private-session-token'}))
+            client = CliClient()
+            result, output, client = self.run_cli(
+                self.json_args('--verify-live', '--session', str(session_path)),
+                client=client)
+            self.assertEqual(json.loads(output)['routes'][0]['status'], 'ok')
+            self.assertEqual(result, 0)
+            self.assertEqual(client.session_calls, ['private-session-token'])
+            self.assertEqual(json.loads(session_path.read_text())['T'],
+                             'rotated-cli-session-token')
+            self.assertEqual(stat.S_IMODE(session_path.stat().st_mode), 0o600)
+            self.assertNotIn('private-session-token', output)
+            self.assertNotIn('rotated-cli-session-token', output)
+
+    def test_invalid_seat_types_are_argparse_error(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            main(self.json_args('--seat-types', 'award,cash'),
+                 environ={}, now=self.now)
+        self.assertIn('--seat-types', stderr.getvalue())
 
 
 class CalendarTests(unittest.TestCase):

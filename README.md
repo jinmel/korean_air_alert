@@ -126,6 +126,9 @@ unset KOREANAIR_USERNAME KOREANAIR_PASSWORD
   파일이 없으면 `KOREANAIR_SESSION_T`를 초기 토큰으로 사용할 수 있습니다.
   성공한 세션 갱신은 파일에 원자적으로 저장하며 권한은 0600입니다. T는 로그인 세션과
   동등한 비밀정보이므로 공유하거나 로그에 남기지 마세요.
+- `--cdp URL` 또는 `KOREANAIR_CDP_URL`을 지정하면 저장된 세션이 만료됐을 때 로그인된
+  Chrome의 원격 디버깅 포트에서 T를 다시 가져옵니다. T는 출력하지 않습니다.
+- Grok Bot용 스킬은 `.grok/skills/korean-air-award-search/SKILL.md`에 있습니다.
 - `--verify-live` 없이 실행하면 환경 변수와 무관하게 로그인하지 않습니다.
 - 로그인 실패 시 재시도하지 않습니다. CAPTCHA/추가 인증이 필요하면 미확인 상태로 종료합니다.
 - 로그인 정보와 회원 정보, 쿠키, 응답 원문을 파일이나 로그에 저장하지 않습니다.

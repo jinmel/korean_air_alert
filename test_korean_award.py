@@ -241,6 +241,33 @@ class CliTests(unittest.TestCase):
             self.assertNotIn('private-session-token', output)
             self.assertNotIn('rotated-cli-session-token', output)
 
+    def test_expired_session_is_regrabbed_from_chrome_cdp(self):
+        class ExpiringClient(CliClient):
+            def login_from_session(self, token):
+                self.session_calls.append(token)
+                if token == 'expired-session-token':
+                    raise RuntimeError('세션 만료')
+                return 'rotated-cli-session-token'
+
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = Path(directory) / 'session.json'
+            session_path.write_text(json.dumps({'T': 'expired-session-token'}))
+            with patch('hermes_alert.grab_session_token',
+                       return_value='chrome-session-token') as grab:
+                result, output, client = self.run_cli(
+                    self.json_args('--verify-live', '--session', str(session_path),
+                                   '--cdp', 'http://127.0.0.1:9222'),
+                    client=ExpiringClient())
+            grab.assert_called_once_with('http://127.0.0.1:9222')
+            self.assertEqual(result, 0)
+            self.assertEqual(client.session_calls,
+                             ['expired-session-token', 'chrome-session-token'])
+            self.assertEqual(json.loads(session_path.read_text())['T'],
+                             'rotated-cli-session-token')
+            for secret in ('expired-session-token', 'chrome-session-token',
+                           'rotated-cli-session-token'):
+                self.assertNotIn(secret, output)
+
     def test_invalid_seat_types_are_argparse_error(self):
         stderr = io.StringIO()
         with redirect_stderr(stderr), self.assertRaises(SystemExit):

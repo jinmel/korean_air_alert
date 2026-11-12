@@ -512,6 +512,7 @@ def main(argv=None, environ=None, client_factory=AwardClient, now=None):
     parser.add_argument('--verify-live', action='store_true',
                         help='후보를 실제 예매 검색으로 재확인(본인 성인 1명)')
     parser.add_argument('--session', help='세션 쿠키 JSON 파일 경로')
+    parser.add_argument('--cdp', help='세션 만료 시 T를 가져올 Chrome 원격 디버깅 주소')
     parser.add_argument('--json', action='store_true', help='결과를 JSON 한 개로 출력')
     args = parser.parse_args(argv)
     environ = os.environ if environ is None else environ
@@ -635,20 +636,22 @@ def main(argv=None, environ=None, client_factory=AwardClient, now=None):
                     if not session_login_attempted:
                         session_login_attempted = True
                         from hermes_alert import (
-                            DEFAULT_SESSION, _read_session, _write_json_atomic,
+                            DEFAULT_SESSION, _login_with_session, _read_session,
+                            _write_json_atomic,
                         )
                         selected_session = (
                             args.session or environ.get('KOREANAIR_SESSION_FILE')
                             or DEFAULT_SESSION)
                         session_path = Path(selected_session).expanduser()
                         token = _read_session(session_path, environ)
-                        if token:
-                            seen_tokens.append(token)
-                            rotated = client.login_from_session(token)
+                        cdp_url = args.cdp or environ.get('KOREANAIR_CDP_URL', '')
+                        if token or cdp_url:
+                            if token:
+                                seen_tokens.append(token)
+                            rotated = _login_with_session(
+                                client, token, cdp_url, seen_tokens)
                             if not isinstance(rotated, str) or not rotated:
                                 raise RuntimeError('세션 쿠키 갱신 결과를 확인하지 못했습니다.')
-                            if rotated:
-                                seen_tokens.append(rotated)
                             _write_json_atomic(session_path, {
                                 'T': rotated, 'updated': stamp,
                             })
